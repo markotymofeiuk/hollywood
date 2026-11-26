@@ -35,7 +35,7 @@ from contracts import (
 # === Modular imports ==================================================
 from utils import normalize_weights, _safe_float, TONE_STYLE_HINTS
 from world_state import WorldState, get_person_latent, get_company_latent, latent_similarity
-from llm_provider import get_llm_client, safe_json_parse
+from llm_provider import get_llm_client, ordered_map, safe_json_parse
 from financials import compute_financials, edge_is_active, record_financial_outcome
 from assembly import (
     sample_movie_concept, pick_director, pick_co_director, pick_companies,
@@ -329,12 +329,20 @@ def _apply_llm_concept_rerank(
 
     changed = 0
     batch_size = 12
-    for start in range(0, len(candidates), batch_size):
-        batch = candidates[start : start + batch_size]
+    # All prompts are built from `candidates` above (usage counts frozen at
+    # that point), so batches are independent: call them concurrently and
+    # apply the picks in batch order, exactly as the serial loop did.
+    batches = [candidates[start : start + batch_size] for start in range(0, len(candidates), batch_size)]
+
+    def _call(batch):
         try:
-            picks = _rerank_batch(world, batch, llm_model)
-        except Exception as exc:
-            print(f"  LLM rerank skipped for batch {start // batch_size + 1}: {exc}")
+            return _rerank_batch(world, batch, llm_model), None
+        except Exception as exc:  # reported in order below
+            return None, exc
+
+    for batch_no, (batch, (picks, error)) in enumerate(ordered_map(_call, batches), start=1):
+        if error is not None:
+            print(f"  LLM rerank skipped for batch {batch_no}: {error}")
             continue
         for item in batch:
             movie_id = int(item["movie_id"])

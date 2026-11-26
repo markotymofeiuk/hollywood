@@ -19,7 +19,7 @@ import os, json, sys, time
 import shutil
 from pathlib import Path
 
-from llm_provider import get_llm_client
+from llm_provider import get_llm_client, ordered_map
 from model_defaults import model_for_role
 
 MODEL = model_for_role("latent_vars")
@@ -573,11 +573,10 @@ def main():
             all_person_latent = list(existing_latent)
             person_batch_offset = _next_jsonl_shard_number(PERSON_SHARD_DIR)
 
-            for batch_start in range(0, len(persons_needing), _batch_size):
-                batch = persons_needing[batch_start:batch_start + _batch_size]
-                batch_num = person_batch_offset + batch_start // _batch_size + 1
-                print(f"\n  Batch {batch_num}/{n_batches} ({len(batch)} persons)...")
-
+            def _person_batch_latents(job):
+                # Worker thread: LLM call, retries and validation only. Merging
+                # and shard writes stay in batch order on the main thread.
+                batch_num, batch = job
                 prompt = build_person_latent_prompt(batch)
                 batch_latents = None
 
@@ -638,9 +637,7 @@ def main():
                                 f"missing {len(missing)} ids, sample={missing[:10]}"
                             )
 
-                        batch_latents = _jitter_to_3dp(cleaned)
-                        all_person_latent.extend(batch_latents)
-                        print(f"  Got {len(batch_latents)} latent vars (3dp jittered)")
+                        batch_latents = cleaned
                         break
 
                     except (json.JSONDecodeError, Exception) as e:
@@ -655,9 +652,18 @@ def main():
 
                 if batch_latents is None:
                     raise RuntimeError(f"Failed to generate a complete person latent batch {batch_num}")
-                _write_jsonl_shard(PERSON_SHARD_DIR, batch_num, batch_latents)
+                return batch_latents
 
-                time.sleep(0.5)
+            person_jobs = [
+                (person_batch_offset + batch_start // _batch_size + 1, persons_needing[batch_start:batch_start + _batch_size])
+                for batch_start in range(0, len(persons_needing), _batch_size)
+            ]
+            for (batch_num, batch), cleaned in ordered_map(_person_batch_latents, person_jobs):
+                print(f"\n  Batch {batch_num}/{n_batches} ({len(batch)} persons)...")
+                batch_latents = _jitter_to_3dp(cleaned)
+                all_person_latent.extend(batch_latents)
+                print(f"  Got {len(batch_latents)} latent vars (3dp jittered)")
+                _write_jsonl_shard(PERSON_SHARD_DIR, batch_num, batch_latents)
 
             with open(latent_path, "w", encoding="utf-8") as f:
                 json.dump(all_person_latent, f, indent=2, ensure_ascii=False)
@@ -720,11 +726,10 @@ def main():
             all_company_latent = list(existing_company_latent)
             company_batch_offset = _next_jsonl_shard_number(COMPANY_SHARD_DIR)
 
-            for batch_start in range(0, len(companies_needing), _batch_size):
-                batch = companies_needing[batch_start:batch_start + _batch_size]
-                batch_num = company_batch_offset + batch_start // _batch_size + 1
-                print(f"\n  Company batch {batch_num}/{n_cbatches} ({len(batch)} companies)...")
-
+            def _company_batch_latents(job):
+                # Worker thread: LLM call, retries and validation only. Merging
+                # and shard writes stay in batch order on the main thread.
+                batch_num, batch = job
                 prompt = build_company_latent_prompt(batch)
                 batch_latents = None
 
@@ -782,8 +787,6 @@ def main():
                                 f"missing {len(missing)} ids, sample={missing[:10]}"
                             )
                         batch_latents = cleaned
-                        all_company_latent.extend(batch_latents)
-                        print(f"  Got {len(batch_latents)} latent vars")
                         break
                     except (json.JSONDecodeError, Exception) as e:
                         print(f"  JSON PARSE ERROR (retry {retry+1}/{MAX_RETRIES}): {e}")
@@ -792,9 +795,17 @@ def main():
 
                 if batch_latents is None:
                     raise RuntimeError(f"Failed to generate a complete company latent batch {batch_num}")
-                _write_jsonl_shard(COMPANY_SHARD_DIR, batch_num, batch_latents)
+                return batch_latents
 
-                time.sleep(0.5)
+            company_jobs = [
+                (company_batch_offset + batch_start // _batch_size + 1, companies_needing[batch_start:batch_start + _batch_size])
+                for batch_start in range(0, len(companies_needing), _batch_size)
+            ]
+            for (batch_num, batch), batch_latents in ordered_map(_company_batch_latents, company_jobs):
+                print(f"\n  Company batch {batch_num}/{n_cbatches} ({len(batch)} companies)...")
+                all_company_latent.extend(batch_latents)
+                print(f"  Got {len(batch_latents)} latent vars")
+                _write_jsonl_shard(COMPANY_SHARD_DIR, batch_num, batch_latents)
 
             with open(company_latent_path, "w", encoding="utf-8") as f:
                 json.dump(all_company_latent, f, indent=2, ensure_ascii=False)

@@ -61,6 +61,9 @@ class AuditTarget:
     category: str = ""
     note: str = ""
     overlap_group: str = ""
+    # False skips the deep size estimate (world_state passes this for
+    # objects that are too large or too shared to walk cheaply).
+    measure: bool = True
 
 
 def audit_target(
@@ -69,8 +72,9 @@ def audit_target(
     category: str = "",
     note: str = "",
     overlap_group: str = "",
+    measure: bool = True,
 ) -> AuditTarget:
-    return AuditTarget(str(name), obj, str(category), str(note), str(overlap_group))
+    return AuditTarget(str(name), obj, str(category), str(note), str(overlap_group), bool(measure))
 
 
 def graph_audit_targets(graph: Any) -> list[AuditTarget]:
@@ -160,7 +164,7 @@ class MemoryAuditRecorder:
                 "category": target.category,
                 "overlap_group": target.overlap_group,
                 "object_count": _object_count(target.obj),
-                "estimated_bytes": _object_size_bytes(target.obj),
+                "estimated_bytes": _object_size_bytes(target.obj) if getattr(target, "measure", True) else 0,
                 "process_rss_bytes": rss_bytes,
                 "plateau_hit": False,
                 "note": note or target.note,

@@ -37,7 +37,7 @@ from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from feather_sink import df_to_arrow, read_table
-from llm_provider import get_llm_client
+from llm_provider import get_llm_client, ordered_map, repair_truncated_json_object
 from model_defaults import model_for_role
 
 BASE_DIR = Path(__file__).parent
@@ -641,8 +641,8 @@ def _refresh_generic_episode_titles(
     dry_run: bool,
     batch_size: int = 8,
 ) -> int:
-    refreshed = 0
-    for series_row in all_series:
+    def _series_titles(series_row: dict) -> list[tuple[int, str]]:
+        # Worker thread: reads only this series' episodes; returns updates.
         sid = int(series_row["series_id"])
         title = str(series_row.get("title", f"Series {sid}"))
         genre = str(series_row.get("genre", "Drama"))
@@ -662,9 +662,11 @@ def _refresh_generic_episode_titles(
                             "description": description,
                         }
                     )
+        updates: list[tuple[int, str]] = []
         if not generic_eps:
-            continue
+            return updates
         print(f"    Refreshing {len(generic_eps)} generic episode titles for '{title}'")
+        updated: set[int] = set()
         for start in range(0, len(generic_eps), batch_size):
             batch = generic_eps[start:start + batch_size]
             text = call_api(
@@ -691,11 +693,18 @@ def _refresh_generic_episode_titles(
                 clean_title = _normalise_text(new_title)
                 if _is_valid_episode_title(clean_title):
                     old_title = str(all_ep_titles.get(eid, "") or "")
-                    if _is_generic_episode_title(old_title):
-                        all_ep_titles[eid] = clean_title
-                        refreshed += 1
-            if not dry_run:
-                time.sleep(SLEEP_BETWEEN_CALLS)
+                    if _is_generic_episode_title(old_title) and eid not in updated:
+                        updates.append((eid, clean_title))
+                        updated.add(eid)
+            # (Fixed SLEEP_BETWEEN_CALLS after every call removed: the
+            # KeyPool limiter paces requests.)
+        return updates
+
+    refreshed = 0
+    for _series_row, updates in ordered_map(_series_titles, list(all_series)):
+        for eid, clean_title in updates:
+            all_ep_titles[eid] = clean_title
+            refreshed += 1
     return refreshed
 
 
@@ -728,7 +737,13 @@ def parse_json_response(text: str) -> dict | list:
         text = "\n".join(lines[1:])
         if text.rstrip().endswith("```"):
             text = text.rstrip()[:-3]
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        repaired = repair_truncated_json_object(text)
+        if repaired is not None:
+            return repaired
+        raise
 
 
 def call_api(llm, model: str, prompt: str, tracker: TokenTracker,
@@ -854,16 +869,12 @@ def main():
 
     all_series_summaries: dict[int, str] = dict(existing_series_summaries)
 
-    for i, series_row in enumerate(all_series):
+    def _series_overview(job):
+        # Worker thread: one series' overview with its retries.
+        i, series_row = job
         sid = int(series_row["series_id"])
         title = series_row.get("title", f"Series {sid}")
-
-        if sid in all_series_summaries:
-            print(f"  [{i+1}/{n_series}] '{title}' -- already has summary, skipping")
-            continue
-
         print(f"  [{i+1}/{n_series}] '{title}'...")
-
         cast_names = series_cast.get(sid, [])
         seasons = series_seasons.get(sid, [])
         text = ""
@@ -882,22 +893,28 @@ def main():
                 label=f"series/{title}",
             )
             if text and _is_valid_series_summary(text):
-                all_series_summaries[sid] = _normalise_text(text)
-                break
+                return _normalise_text(text)
             if args.dry_run:
-                break
+                return None
             if attempt < 3:
                 print(f"    Invalid series summary for series {sid}, retrying ({attempt + 1}/3)...")
                 time.sleep(SLEEP_BETWEEN_CALLS)
-        else:
-            if not args.dry_run:
-                print(f"    FAILED or invalid summary for series {sid}, using empty string")
-                all_series_summaries[sid] = ""
+        print(f"    FAILED or invalid summary for series {sid}, using empty string")
+        return ""
 
-        if not args.dry_run:
-            time.sleep(SLEEP_BETWEEN_CALLS)
+    tier1_jobs = []
+    for i, series_row in enumerate(all_series):
+        sid = int(series_row["series_id"])
+        if sid in all_series_summaries:
+            print(f"  [{i+1}/{n_series}] '{series_row.get('title', f'Series {sid}')}' -- already has summary, skipping")
+            continue
+        tier1_jobs.append((i, series_row))
 
-    # Write Tier 1 results back to series_df
+    # (The fixed SLEEP_BETWEEN_CALLS after every series is gone: pacing is
+    # the KeyPool limiter's job. Sleeps after invalid attempts remain.)
+    for (i, series_row), value in ordered_map(_series_overview, tier1_jobs):
+        if value is not None:
+            all_series_summaries[int(series_row["series_id"])] = value
         if not args.dry_run and (((i + 1) % save_every_series == 0) or ((i + 1) == n_series)):
             _save_tv_series_outputs(base_dir, series_df, all_series_summaries)
             print(f"\n  Saved series summaries -> {base_dir / 'tv_series.csv'}")
@@ -907,7 +924,17 @@ def main():
 
     all_ep_descriptions: dict[int, str] = dict(existing_ep_descriptions)
 
-    for i, series_row in enumerate(all_series):
+    def _series_episodes(job):
+        # Worker thread: one series' seasons in order (continuity notes run
+        # season to season inside a series; series are independent). Works
+        # on a private dict of this series' descriptions, merged in order.
+        i, series_row = job
+        series_ep_ids = [
+            int(ep["episode_id"])
+            for season in series_seasons.get(int(series_row["series_id"]), [])
+            for ep in season_episodes.get(season["season_id"], [])
+        ]
+        series_desc = {eid: all_ep_descriptions[eid] for eid in series_ep_ids if eid in all_ep_descriptions}
         sid = int(series_row["series_id"])
         title = series_row.get("title", f"Series {sid}")
         genre = str(series_row.get("genre", "Drama"))
@@ -929,17 +956,17 @@ def main():
 
             # Check if all episodes in this season already have descriptions
             ep_ids = [ep["episode_id"] for ep in episodes]
-            already_done = sum(1 for eid in ep_ids if eid in all_ep_descriptions)
+            already_done = sum(1 for eid in ep_ids if eid in series_desc)
             if already_done == len(ep_ids):
                 print(f"    S{sn_num}: all {len(episodes)} eps already described, skipping")
                 # Still need to set continuity from last episode
                 last_ep_id = ep_ids[-1]
-                last_desc = all_ep_descriptions.get(last_ep_id, "")
+                last_desc = series_desc.get(last_ep_id, "")
                 if last_desc:
                     previous_finale_line = _continuity_tail(last_desc)
                 continue
 
-            missing_eps = [ep for ep in episodes if ep["episode_id"] not in all_ep_descriptions]
+            missing_eps = [ep for ep in episodes if ep["episode_id"] not in series_desc]
             episode_batches = _chunk_sequence(missing_eps, episode_batch_size)
 
             for batch_index, batch in enumerate(episode_batches, start=1):
@@ -989,9 +1016,9 @@ def main():
                                     continue
                                 clean_desc = _normalise_text(desc)
                                 if _is_valid_episode_description(clean_desc):
-                                    all_ep_descriptions[eid] = clean_desc
+                                    series_desc[eid] = clean_desc
 
-                            got = sum(1 for eid in batch_ep_ids if eid in all_ep_descriptions)
+                            got = sum(1 for eid in batch_ep_ids if eid in series_desc)
                             print(f"got {got}/{len(batch)}")
 
                             if got < len(batch):
@@ -999,9 +1026,9 @@ def main():
                                 if len(values) == len(batch):
                                     for ep, desc in zip(batch, values):
                                         eid = ep["episode_id"]
-                                        if eid not in all_ep_descriptions:
-                                            all_ep_descriptions[eid] = desc
-                                    got = sum(1 for eid in batch_ep_ids if eid in all_ep_descriptions)
+                                        if eid not in series_desc:
+                                            series_desc[eid] = desc
+                                    got = sum(1 for eid in batch_ep_ids if eid in series_desc)
                                     print(
                                         f"    Positional fallback applied for S{sn_num} batch {batch_index} ({got}/{len(batch)})"
                                     )
@@ -1011,7 +1038,7 @@ def main():
                                     previous_finale_line = finale_line
                                 else:
                                     previous_finale_line = _continuity_tail(
-                                        all_ep_descriptions.get(batch_ep_ids[-1], "")
+                                        series_desc.get(batch_ep_ids[-1], "")
                                     )
                                 break
                             if semantic_attempt < 2:
@@ -1032,10 +1059,14 @@ def main():
 
             if ep_ids:
                 last_ep_id = ep_ids[-1]
-                last_desc = all_ep_descriptions.get(last_ep_id, "")
+                last_desc = series_desc.get(last_ep_id, "")
                 if last_desc:
                     previous_finale_line = _continuity_tail(last_desc)
 
+        return series_desc
+
+    for (i, series_row), series_desc in ordered_map(_series_episodes, list(enumerate(all_series))):
+        all_ep_descriptions.update(series_desc)
         # Incremental save after each series
         if not args.dry_run and (((i + 1) % save_every_series == 0) or ((i + 1) == n_series)):
             _save_episode_outputs(base_dir, episodes_df, all_ep_descriptions, all_ep_titles)

@@ -738,6 +738,16 @@ def run_post_generation_critic(
     movie_count = int(len(movies)) if movies is not None else 0
     coverage_floor = max(sample_size, int(np.ceil(float(movie_count) * 0.12))) if movie_count > 0 else sample_size
     sample_size = min(movie_count, max(sample_size, coverage_floor)) if movie_count > 0 else sample_size
+    # The 12% coverage floor makes one prompt of ~290 tokens per sampled
+    # movie (690K tokens at 20K movies), beyond a 131K-context model.
+    # DATA_SYS_CRITIC_MAX_SAMPLE caps the sample (0 = unlimited, the old
+    # behaviour). At most 40 actions are applied either way.
+    try:
+        critic_cap = int(os.environ.get("DATA_SYS_CRITIC_MAX_SAMPLE", "0") or 0)
+    except ValueError:
+        critic_cap = 0
+    if critic_cap > 0:
+        sample_size = min(sample_size, critic_cap)
     max_actions = min(40, max(max_actions, sample_size * 2))
 
     structural_gate = _precritic_structural_gate(result, world)

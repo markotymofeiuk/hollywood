@@ -30,7 +30,7 @@ except ImportError:
               "Romance", "Animation", "Documentary", "Fantasy", "Crime",
               "Mystery", "Western", "Film-Noir", "Sport", "Family"]
 
-from llm_provider import get_llm_client
+from llm_provider import get_llm_client, ordered_map
 from model_defaults import model_for_role
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -251,21 +251,25 @@ def main():
           f"using {model}")
 
     all_results = {}
-    for batch_idx in range(n_batches):
-        start = batch_idx * BATCH_SIZE
-        end = min(start + BATCH_SIZE, len(keywords_to_process))
-        batch_kws = keywords_to_process[start:end]
+    # Batches are independent: call concurrently, merge in batch order.
+    batches = [keywords_to_process[i * BATCH_SIZE:(i + 1) * BATCH_SIZE] for i in range(n_batches)]
 
+    def _call(batch_kws):
+        try:
+            return assign_genres_batch(llm, model, batch_kws, GENRES), None
+        except Exception as exc:
+            return None, exc
+
+    for batch_idx, (batch_kws, (results, exc)) in enumerate(ordered_map(_call, batches)):
         print(f"  Batch {batch_idx + 1}/{n_batches} ({len(batch_kws)} keywords)...",
               end="", flush=True)
 
-        try:
-            results = assign_genres_batch(llm, model, batch_kws, GENRES)
+        if exc is None:
             # Map results back by keyword name
             for r in results:
                 all_results[r["keyword"]] = r
             print(f" OK ({len(results)} assigned)")
-        except Exception as exc:
+        else:
             print(f" ERROR: {exc}")
             # Fallback: assign Drama + 0.3 for failed batch
             for kw in batch_kws:

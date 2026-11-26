@@ -155,6 +155,9 @@ def _build_gemini_http_options() -> Any | None:
     return types.HttpOptions(client_args=client_args)
 
 
+_USAGE_LOG_LOCK = threading.Lock()
+
+
 def _write_usage_log(entry: Dict[str, Any]) -> None:
     targets = []
     primary = os.getenv("DATA_SYS_LLM_USAGE_LOG")
@@ -172,15 +175,26 @@ def _write_usage_log(entry: Dict[str, Any]) -> None:
         unique_targets.append(raw)
     if not unique_targets:
         return
-    for raw in unique_targets:
-        try:
-            target = Path(raw)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with target.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry, ensure_ascii=True, default=str))
-                handle.write("\n")
-        except Exception:
-            pass
+    line = json.dumps(entry, ensure_ascii=True, default=str) + "\n"
+    with _USAGE_LOG_LOCK:
+        for raw in unique_targets:
+            try:
+                target = Path(raw)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open("a", encoding="utf-8") as handle:
+                    handle.write(line)
+            except Exception:
+                pass
+
+
+def _prompt_kind(prompt: str) -> str:
+    """Name of the prompt archetype (shared with the fake provider), or ''."""
+    try:
+        import fake_llm
+
+        return fake_llm.classify(prompt) or ""
+    except Exception:
+        return ""
 
 
 def _log_llm_success(
@@ -191,10 +205,13 @@ def _log_llm_success(
     temperature: float,
     max_tokens: int,
     stats: "RetryStats",
+    latency_sec: float = 0.0,
 ) -> None:
     _write_usage_log(
         {
             "event": "llm_call",
+            "prompt_kind": _prompt_kind(prompt),
+            "latency_sec": round(float(latency_sec), 4),
             "step_id": os.getenv("DATA_SYS_STEP_ID", ""),
             "step_name": os.getenv("DATA_SYS_STEP_NAME", ""),
             "provider": os.getenv("LLM_PROVIDER", "gemini"),
@@ -231,6 +248,7 @@ def _log_llm_failure(
     _write_usage_log(
         {
             "event": "llm_error",
+            "prompt_kind": _prompt_kind(prompt),
             "step_id": os.getenv("DATA_SYS_STEP_ID", ""),
             "step_name": os.getenv("DATA_SYS_STEP_NAME", ""),
             "provider": os.getenv("LLM_PROVIDER", "gemini"),
@@ -279,11 +297,213 @@ def _call_with_timeout(fn: Callable[[], Any], timeout_sec: float) -> Any:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Rate limiting across API keys (requests/min and tokens/min per key)
+# ═══════════════════════════════════════════════════════════════════════
+
+class _Lease:
+    """One admitted request on one key; settle() replaces the token estimate."""
+
+    __slots__ = ("key", "entry", "limiter")
+
+    def __init__(self, key: str, entry: list, limiter: "KeyPool") -> None:
+        self.key = key
+        self.entry = entry  # [timestamp, tokens]
+        self.limiter = limiter
+
+    def settle(self, tokens: int | None) -> None:
+        if tokens is not None and tokens > 0:
+            with self.limiter._cond:
+                self.entry[1] = int(tokens)
+                self.limiter._cond.notify_all()
+
+    def penalize(self, seconds: float) -> None:
+        self.limiter.block_key(self.key, seconds)
+
+
+class KeyPool:
+    """Sliding 60-second window limiter over one or more API keys.
+
+    Each request is admitted on the key that can take it soonest, keeping
+    both requests and tokens in the last 60 s under ``safety * limit``. The
+    token count of a request is an estimate until settle() records the
+    usage the server reports. Limits are per process: run one pipeline per
+    key set at a time (or give concurrent runs disjoint keys).
+    """
+
+    WINDOW = 60.0
+    # Short window that caps bursts at BURST x the average rate, so a cold
+    # start does not fire a whole minute's allowance in one second.
+    SHORT_WINDOW = 10.0
+    BURST = 2.0
+
+    def __init__(self, keys: List[str], *, rpm: float, tpm: float, safety: float = 0.9) -> None:
+        if not keys:
+            raise ValueError("KeyPool needs at least one key")
+        self.keys = list(keys)
+        self.rpm = max(1.0, float(rpm) * float(safety))
+        self.tpm = max(1.0, float(tpm) * float(safety))
+        self._events: Dict[str, Any] = {k: [] for k in self.keys}
+        self._blocked_until: Dict[str, float] = {k: 0.0 for k in self.keys}
+        self._cond = threading.Condition()
+
+    def _admit_at(self, key: str, est_tokens: int, now: float) -> float:
+        events = self._events[key]
+        cutoff = now - self.WINDOW
+        while events and events[0][0] <= cutoff:
+            events.pop(0)
+        t = max(now, self._blocked_until[key])
+        if len(events) >= self.rpm:
+            t = max(t, events[len(events) - int(self.rpm)][0] + self.WINDOW)
+        short_cap = max(1, int(self.rpm * self.SHORT_WINDOW / self.WINDOW * self.BURST))
+        short_start = now - self.SHORT_WINDOW
+        recent = [e for e in events if e[0] > short_start]
+        if len(recent) >= short_cap:
+            t = max(t, recent[len(recent) - short_cap][0] + self.SHORT_WINDOW)
+        short_tok_cap = self.tpm * self.SHORT_WINDOW / self.WINDOW * self.BURST
+        recent_tok = sum(e[1] for e in recent)
+        if recent and recent_tok + est_tokens > short_tok_cap:
+            freed = 0
+            for ts, tok in recent:
+                freed += tok
+                if recent_tok - freed + est_tokens <= short_tok_cap:
+                    t = max(t, ts + self.SHORT_WINDOW)
+                    break
+            else:
+                t = max(t, recent[-1][0] + self.SHORT_WINDOW)
+        used = sum(e[1] for e in events)
+        if events and used + est_tokens > self.tpm:
+            freed = 0
+            for ts, tok in events:
+                freed += tok
+                if used - freed + est_tokens <= self.tpm:
+                    t = max(t, ts + self.WINDOW)
+                    break
+            else:
+                t = max(t, events[-1][0] + self.WINDOW)
+        return t
+
+    def acquire(self, est_tokens: int) -> _Lease:
+        est = max(1, int(est_tokens))
+        with self._cond:
+            while True:
+                now = time.time()
+                best_key, best_t, best_load = None, float("inf"), float("inf")
+                for key in self.keys:
+                    t = self._admit_at(key, est, now)
+                    events = self._events[key]
+                    load = max(len(events) / self.rpm, sum(e[1] for e in events) / self.tpm)
+                    # Earliest admission first; among keys free now, the least loaded.
+                    if (max(t, now), load) < (max(best_t, now), best_load):
+                        best_key, best_t, best_load = key, t, load
+                if best_t <= now:
+                    entry = [now, est]
+                    self._events[best_key].append(entry)
+                    return _Lease(best_key, entry, self)
+                self._cond.wait(timeout=min(1.0, max(0.01, best_t - now)))
+
+    def block_key(self, key: str, seconds: float) -> None:
+        with self._cond:
+            self._blocked_until[key] = max(self._blocked_until[key], time.time() + float(seconds))
+
+
+def _key_pool_from_env(keys: List[str], prefix: str = "DATA_SYS_LLM") -> Optional[KeyPool]:
+    rpm = _env_float(f"{prefix}_RPM", 0.0)
+    tpm = _env_float(f"{prefix}_TPM", 0.0)
+    if rpm <= 0 and tpm <= 0:
+        return None
+    return KeyPool(
+        keys,
+        rpm=rpm if rpm > 0 else 1e9,
+        tpm=tpm if tpm > 0 else 1e12,
+        safety=_env_float(f"{prefix}_LIMIT_SAFETY", 0.9, minimum=0.1),
+    )
+
+
+_OUTPUT_ESTIMATES: Dict[str, list] = {}
+_OUTPUT_ESTIMATES_LOCK = threading.Lock()
+
+
+def _estimate_request_tokens(prompt: str, max_tokens: int) -> int:
+    """Prompt tokens (chars/3.2, conservative) + running mean output for this prompt kind."""
+    kind = _prompt_kind(prompt)
+    with _OUTPUT_ESTIMATES_LOCK:
+        total, n = _OUTPUT_ESTIMATES.get(kind, (0, 0))
+    expected_out = (total / n) if n >= 3 else min(int(max_tokens or 4096), 4096)
+    return int(len(prompt) / 3.2) + int(expected_out)
+
+
+def _record_output_tokens(prompt: str, output_tokens: int) -> None:
+    if output_tokens <= 0:
+        return
+    kind = _prompt_kind(prompt)
+    with _OUTPUT_ESTIMATES_LOCK:
+        total, n = _OUTPUT_ESTIMATES.get(kind, (0, 0))
+        _OUTPUT_ESTIMATES[kind] = (total + int(output_tokens), n + 1)
+
+
+def llm_concurrency() -> int:
+    """Worker count for concurrent LLM maps (DATA_SYS_LLM_CONCURRENCY, default 1 = serial)."""
+    return _env_int("DATA_SYS_LLM_CONCURRENCY", 1, minimum=1)
+
+
+def ordered_map(
+    fn: Callable[[Any], Any],
+    items: List[Any],
+    *,
+    workers: Optional[int] = None,
+    prepare: Optional[Callable[[Any], Any]] = None,
+):
+    """Yield (item, result) in input order while running fn concurrently.
+
+    workers=1 runs fn inline, exactly like a plain loop. With more workers at
+    most ``2 * workers`` items are in flight, so memory stays bounded. If fn
+    raises, no new items start, in-flight ones finish, and the exception is
+    raised when its item's turn comes (earlier results are yielded first).
+
+    ``prepare(item)`` runs on the calling thread when the item is submitted
+    and its return value is what fn receives. Item k is submitted after the
+    caller has consumed items 0..k-window, so state captured in prepare is
+    deterministic: it reflects exactly the first k-window+1 results
+    (window = 2 * workers; with workers=1 it reflects all earlier results).
+    """
+    n_workers = llm_concurrency() if workers is None else max(1, int(workers))
+    items = list(items)
+    prep = prepare if prepare is not None else (lambda item: item)
+    if n_workers <= 1 or len(items) <= 1:
+        for item in items:
+            yield item, fn(prep(item))
+        return
+    window = 2 * n_workers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="llm") as pool:
+        futures: Dict[int, Any] = {}
+        next_submit = 0
+        failed = False
+        for idx in range(len(items)):
+            while not failed and next_submit < len(items) and next_submit < idx + window:
+                futures[next_submit] = pool.submit(fn, prep(items[next_submit]))
+                next_submit += 1
+            future = futures.pop(idx)
+            try:
+                result = future.result()
+            except BaseException:
+                failed = True
+                for other in futures.values():
+                    other.cancel()
+                raise
+            yield items[idx], result
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Abstract Provider
 # ═══════════════════════════════════════════════════════════════════════
 
 class LLMProvider(ABC):
     """Abstract base for LLM backends."""
+
+    # Set by providers that enforce timeouts themselves (no watchdog thread).
+    native_timeout: bool = False
+    # Optional KeyPool; when set, every attempt is admitted by the limiter.
+    key_pool: Optional[KeyPool] = None
 
     @abstractmethod
     def _raw_generate(
@@ -295,6 +515,8 @@ class LLMProvider(ABC):
         temperature: float,
         max_tokens: int,
         thinking_budget: int | None = None,
+        api_key: str | None = None,
+        timeout_sec: float | None = None,
     ) -> LLMResponse:
         """Execute a single LLM call (no retry). Subclasses implement this."""
         ...
@@ -319,7 +541,7 @@ class LLMProvider(ABC):
         last_err: Optional[BaseException] = None
         rng = random.Random()
 
-        effective_model = model or self.default_model
+        effective_model = self.resolve_model(model)
         effective_timeout_sec = _env_float("DATA_SYS_LLM_TIMEOUT_SEC", timeout_sec, minimum=5.0)
         effective_max_attempts = _env_int("DATA_SYS_LLM_MAX_ATTEMPTS", max_attempts, minimum=1)
         effective_base_delay_sec = _env_float("DATA_SYS_LLM_BASE_DELAY_SEC", base_delay_sec, minimum=0.0)
@@ -331,19 +553,29 @@ class LLMProvider(ABC):
 
         for attempt in range(1, effective_max_attempts + 1):
             stats.attempts += 1
+            lease = None
+            if self.key_pool is not None:
+                lease = self.key_pool.acquire(_estimate_request_tokens(prompt, max_tokens))
+            attempt_started = time.perf_counter()
             try:
-                resp = _call_with_timeout(
-                    lambda: self._raw_generate(
-                        prompt,
-                        model=effective_model,
-                        json_mode=json_mode,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        thinking_budget=thinking_budget,
-                    ),
+                call = lambda: self._raw_generate(  # noqa: E731
+                    prompt,
+                    model=effective_model,
+                    json_mode=json_mode,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    thinking_budget=thinking_budget,
+                    api_key=lease.key if lease is not None else None,
                     timeout_sec=effective_timeout_sec,
                 )
+                if self.native_timeout:
+                    resp = call()
+                else:
+                    resp = _call_with_timeout(call, timeout_sec=effective_timeout_sec)
                 resp.model = effective_model
+                if lease is not None:
+                    lease.settle(int(resp.input_tokens or 0) + int(resp.output_tokens or 0))
+                _record_output_tokens(prompt, int(resp.output_tokens or 0))
                 _log_llm_success(
                     response=resp,
                     prompt=prompt,
@@ -351,11 +583,14 @@ class LLMProvider(ABC):
                     temperature=temperature,
                     max_tokens=max_tokens,
                     stats=stats,
+                    latency_sec=time.perf_counter() - attempt_started,
                 )
                 return resp
             except BaseException as exc:
                 last_err = exc
                 stats.errors.append(str(exc))
+                if lease is not None and ("429" in str(exc) or "rate limit" in str(exc).lower()):
+                    lease.penalize(_env_float("DATA_SYS_LLM_429_COOLDOWN_SEC", 20.0, minimum=0.0))
 
                 retriable = isinstance(exc, TimeoutError) or _is_retriable(exc)
 
@@ -389,6 +624,14 @@ class LLMProvider(ABC):
     def default_model(self) -> str:
         ...
 
+    def resolve_model(self, requested: Optional[str]) -> str:
+        """Model actually sent. With DATA_SYS_LLM_PIN_MODEL=1 every call uses
+        the provider default, ignoring per-step names (the steps default to
+        Gemini model ids via model_defaults.model_for_role)."""
+        if _env_flag("DATA_SYS_LLM_PIN_MODEL", False):
+            return self.default_model
+        return requested or self.default_model
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Gemini Provider (Google AI Studio / Vertex)
@@ -419,6 +662,8 @@ class GeminiProvider(LLMProvider):
         temperature: float,
         max_tokens: int,
         thinking_budget: int | None = None,
+        api_key: str | None = None,
+        timeout_sec: float | None = None,
     ) -> LLMResponse:
         config: Dict[str, Any] = {
             "temperature": temperature,
@@ -473,15 +718,29 @@ class OpenAICompatibleProvider(LLMProvider):
       - LOCAL_LLM_API_KEY: optional API key (some servers require one)
     """
 
+    native_timeout = True
+
     def __init__(
         self,
         base_url: str = "http://localhost:8000/v1",
         model: str = "served-model",
         api_key: str = "not-needed",
+        api_keys: Optional[List[str]] = None,
     ):
         self._base_url = base_url.rstrip("/")
         self._default_model = model
         self._api_key = api_key
+        self._api_keys = [k for k in (api_keys or []) if k] or [api_key]
+        self.key_pool = _key_pool_from_env(self._api_keys)
+        self._local = threading.local()
+        # Optional JSON merged into every chat/completions body, e.g.
+        # {"chat_template_kwargs": {"thinking": false}} for reasoning models.
+        raw_extra = os.getenv("DATA_SYS_LLM_EXTRA_BODY", "").strip()
+        self._extra_body: Dict[str, Any] = json.loads(raw_extra) if raw_extra else {}
+        # "object" sends response_format=json_object (forces a top-level
+        # object, which breaks prompts that ask for a JSON array); the
+        # default "prompt" relies on the prompt and normalises the reply.
+        self._json_mode = os.getenv("DATA_SYS_OPENAI_JSON_MODE", "prompt").strip().lower()
 
         # Lazy import — requests is almost always available
         try:
@@ -546,6 +805,7 @@ class OpenAICompatibleProvider(LLMProvider):
         temperature: float,
         max_tokens: int,
         thinking_budget: int | None = None,
+        **_ignored: Any,
     ) -> LLMResponse:
         import requests
 
@@ -585,6 +845,7 @@ class OpenAICompatibleProvider(LLMProvider):
         temperature: float,
         max_tokens: int,
         thinking_budget: int | None = None,
+        **_ignored: Any,
     ) -> LLMResponse:
         import requests
 
@@ -607,6 +868,15 @@ class OpenAICompatibleProvider(LLMProvider):
         data = resp.json()
         return self._parse_ollama_native_response(data, model=model)
 
+    def _session(self):
+        import requests
+
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            self._local.session = session
+        return session
+
     def _raw_generate(
         self,
         prompt: str,
@@ -616,6 +886,8 @@ class OpenAICompatibleProvider(LLMProvider):
         temperature: float,
         max_tokens: int,
         thinking_budget: int | None = None,
+        api_key: str | None = None,
+        timeout_sec: float | None = None,
     ) -> LLMResponse:
         import requests
 
@@ -633,8 +905,9 @@ class OpenAICompatibleProvider(LLMProvider):
         headers = {
             "Content-Type": "application/json",
         }
-        if self._api_key and self._api_key != "not-needed":
-            headers["Authorization"] = f"Bearer {self._api_key}"
+        key = api_key or self._api_key
+        if key and key != "not-needed":
+            headers["Authorization"] = f"Bearer {key}"
 
         body: Dict[str, Any] = {
             "model": model,
@@ -642,10 +915,12 @@ class OpenAICompatibleProvider(LLMProvider):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        if json_mode:
+        if json_mode and self._json_mode == "object":
             body["response_format"] = {"type": "json_object"}
+        body.update(self._extra_body)
 
-        resp = requests.post(url, json=body, headers=headers, timeout=120)
+        read_timeout = float(timeout_sec) if timeout_sec else 120.0
+        resp = self._session().post(url, json=body, headers=headers, timeout=(15.0, read_timeout))
         if resp.status_code == 404 and self._looks_like_ollama():
             return self._raw_generate_ollama_native(
                 prompt,
@@ -670,10 +945,16 @@ class OpenAICompatibleProvider(LLMProvider):
                     parts.append(str(item))
             text = "".join(parts)
         text = str(text or "")
+        if json_mode and self._json_mode != "raw":
+            # Strip fences/think blocks and re-serialise, so step parsers
+            # that call json.loads directly see clean JSON.
+            parsed = safe_json_parse(text)
+            if parsed is not None:
+                text = json.dumps(parsed, ensure_ascii=False)
 
-        usage = data.get("usage", {})
-        inp_tokens = usage.get("prompt_tokens", 0)
-        out_tokens = usage.get("completion_tokens", 0)
+        usage = data.get("usage", {}) or {}
+        inp_tokens = int(usage.get("prompt_tokens", 0) or 0)
+        out_tokens = int(usage.get("completion_tokens", 0) or 0)
 
         return LLMResponse(
             text=text,
@@ -681,6 +962,50 @@ class OpenAICompatibleProvider(LLMProvider):
             output_tokens=out_tokens,
             model=model,
             raw=data,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Fake Provider (offline measurement and determinism tests)
+# ═══════════════════════════════════════════════════════════════════════
+
+class FakeProvider(LLMProvider):
+    """Deterministic offline backend; see fake_llm.py.
+
+    Responses depend only on the prompt text, so serial and parallel runs
+    can be compared byte-for-byte. Token counts are chars/4 estimates.
+    """
+
+    def __init__(self, default_model: str = "fake-llm") -> None:
+        self._default_model = default_model
+        n_keys = _env_int("FAKE_LLM_KEYS", 1, minimum=1)
+        self.key_pool = _key_pool_from_env([f"fake-key-{i}" for i in range(n_keys)])
+
+    @property
+    def default_model(self) -> str:
+        return self._default_model
+
+    def _raw_generate(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        json_mode: bool,
+        temperature: float,
+        max_tokens: int,
+        thinking_budget: int | None = None,
+        api_key: str | None = None,
+        timeout_sec: float | None = None,
+    ) -> LLMResponse:
+        import fake_llm
+
+        fake_llm.fake_latency()
+        _handler, text = fake_llm.fake_response_text(prompt)
+        return LLMResponse(
+            text=text,
+            input_tokens=fake_llm.estimate_tokens(prompt),
+            output_tokens=fake_llm.estimate_tokens(text),
+            model=model,
         )
 
 
@@ -732,16 +1057,22 @@ def get_llm_client(
                 "Set it to the model name exposed by the OpenAI-compatible backend."
             )
         api_key = os.getenv("LOCAL_LLM_API_KEY", "not-needed")
+        # Several keys (comma-separated) share the load via the KeyPool.
+        api_keys = [k.strip() for k in os.getenv("LOCAL_LLM_API_KEYS", "").split(",") if k.strip()]
         _global_client = OpenAICompatibleProvider(
             base_url=base_url,
             model=model,
             api_key=api_key,
+            api_keys=api_keys or [api_key],
         )
+
+    elif provider_name == "fake":
+        _global_client = FakeProvider()
 
     else:
         raise ValueError(
             f"Unknown LLM_PROVIDER='{provider_name}'. "
-            f"Supported: gemini, local, vllm, ollama, tgi, litellm"
+            f"Supported: gemini, local, vllm, ollama, tgi, litellm, fake"
         )
 
     return _global_client
@@ -819,6 +1150,32 @@ def llm_generate(
         max_attempts=max_attempts,
         on_retry=on_retry,
     )
+
+
+def repair_truncated_json_object(text: str) -> Any:
+    """Parse a JSON object whose only defect is its ending.
+
+    DeepSeek V4 sometimes drops the closing brace after the last string
+    value, or adds a stray quote after it. This tries exactly those two
+    repairs and returns the parsed dict, or None. Anything malformed in the
+    middle still fails, so the caller's retry logic is unchanged for it.
+    """
+    value = str(text or "").strip()
+    if not value.startswith("{"):
+        return None
+    candidates = []
+    if value.endswith('"'):
+        candidates.append(value + "}")           # missing final brace
+    if value.endswith('}"'):
+        candidates.append(value[:-1])            # stray quote after brace
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
 
 
 def safe_json_parse(text: str) -> Any:

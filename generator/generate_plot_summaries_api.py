@@ -18,7 +18,7 @@ import pandas as pd
 
 from dotenv import load_dotenv
 from feather_sink import df_to_arrow, read_table
-from llm_provider import get_llm_client
+from llm_provider import get_llm_client, llm_concurrency, ordered_map
 from model_defaults import model_for_role
 
 MODEL = model_for_role("plot_summaries")
@@ -694,6 +694,11 @@ def main():
     # Build movie context for prompts
     movies_data = []
     flat_title_ids = set(flat_df["title_id"].values) if flat_df is not None else set()
+    # First flat row per title_id, built once (was a full-table scan per movie).
+    flat_first_row = {}
+    if flat_df is not None:
+        for flat_row in flat_df.drop_duplicates("title_id", keep="first").itertuples(index=False):
+            flat_first_row[flat_row.title_id] = flat_row
     for _, row in movies_df.iterrows():
         mid = row["title_id"]
         m = {
@@ -709,10 +714,10 @@ def main():
 
         # Get director + actors + keywords from flat table
         if flat_df is not None and mid in flat_title_ids:
-            flat_row = flat_df[flat_df["title_id"] == mid].iloc[0]
-            m["director"] = str(flat_row.get("director", "Unknown"))
-            m["actors"] = str(flat_row.get("actors", ""))
-            m["keywords"] = str(flat_row.get("keywords", ""))
+            flat_row = flat_first_row[mid]
+            m["director"] = str(getattr(flat_row, "director", "Unknown"))
+            m["actors"] = str(getattr(flat_row, "actors", ""))
+            m["keywords"] = str(getattr(flat_row, "keywords", ""))
         else:
             m["director"] = "Unknown"
             m["actors"] = ""
@@ -765,23 +770,49 @@ def main():
         phrase_blacklist.extend(_extract_key_phrases(text))
     dup_warnings = 0
 
-    for batch_start in range(0, len(movies_needing), batch_size):
-        batch = movies_needing[batch_start:batch_start + batch_size]
-        batch_num = batch_start // batch_size + 1
-        print(f"\n  Batch {batch_num}/{n_batches} ({len(batch)} movies)...")
-        batch_results = _generate_batch_summaries(
+    # Batches run concurrently (DATA_SYS_LLM_CONCURRENCY). Each batch's
+    # prompt takes the blacklist as it stands when the batch is queued, which
+    # includes every batch up to 2*workers earlier; with one worker this is
+    # exactly the serial rolling blacklist.
+    jobs = [
+        (batch_start // batch_size + 1, movies_needing[batch_start:batch_start + batch_size])
+        for batch_start in range(0, len(movies_needing), batch_size)
+    ]
+
+    def _prepare(job):
+        return job[0], job[1], list(phrase_blacklist)
+
+    def _run(prepared):
+        batch_num, batch, blacklist_snapshot = prepared
+        return _generate_batch_summaries(
             llm=llm,
             model=_model,
             batch=batch,
             batch_num_label=f"{batch_num}",
             tracker=tracker,
-            phrase_blacklist=phrase_blacklist,
+            phrase_blacklist=blacklist_snapshot,
         )
+
+    # Checkpoints rewrite the whole movie table, so by default they are
+    # time-based; DATA_SYS_PLOT_SAVE_EVERY_BATCHES restores batch cadence.
+    explicit_batch_cadence = bool(str(os.environ.get("DATA_SYS_PLOT_SAVE_EVERY_BATCHES", "") or "").strip())
+    save_every_sec = float(os.environ.get("DATA_SYS_PLOT_SAVE_EVERY_SEC", "600") or 600)
+    last_save = time.time()
+    # The near-duplicate check only prints its first 5 warnings and is
+    # O(batch x 30) pure-Python Levenshtein; stop once it can no longer print.
+    near_dup_check_batches = int(os.environ.get("DATA_SYS_PLOT_NEAR_DUP_CHECK_BATCHES", "200") or 200)
+
+    for (batch_num, batch), batch_results in ordered_map(_run, jobs, workers=llm_concurrency(), prepare=_prepare):
+        print(f"\n  Batch {batch_num}/{n_batches} ({len(batch)} movies)...")
         all_summaries.update(batch_results)
 
-        should_checkpoint = (batch_num % save_every_batches == 0) or (batch_num == n_batches)
+        if explicit_batch_cadence:
+            should_checkpoint = (batch_num % save_every_batches == 0) or (batch_num == n_batches)
+        else:
+            should_checkpoint = (time.time() - last_save >= save_every_sec) or (batch_num == n_batches)
         if should_checkpoint:
             _save_movie_outputs(base_dir, movies_df, all_summaries)
+            last_save = time.time()
             print(f"  Checkpoint saved after batch {batch_num}/{n_batches}")
 
         # v11 P1: Update anti-duplication blacklist with this batch's phrases
@@ -791,12 +822,13 @@ def main():
                 phrase_blacklist.extend(_extract_key_phrases(ps))
                 # Levenshtein near-duplicate check against recent summaries
                 ps_lower = ps.lower().strip()
-                for prev in recent_summaries:
-                    dist = _levenshtein_distance(ps_lower[:80], prev[:80])
-                    if dist < 15:
-                        dup_warnings += 1
-                        if dup_warnings <= 5:  # don't spam
-                            print(f"  [warn] Near-duplicate detected (Levenshtein={dist}): {ps[:60]}...")
+                if dup_warnings < 5 and batch_num <= near_dup_check_batches:
+                    for prev in recent_summaries:
+                        dist = _levenshtein_distance(ps_lower[:80], prev[:80])
+                        if dist < 15:
+                            dup_warnings += 1
+                            if dup_warnings <= 5:  # don't spam
+                                print(f"  [warn] Near-duplicate detected (Levenshtein={dist}): {ps[:60]}...")
                 recent_summaries.append(ps_lower)
                 if len(recent_summaries) > 30:
                     recent_summaries.pop(0)
@@ -804,9 +836,8 @@ def main():
         if len(phrase_blacklist) > 100:
             phrase_blacklist = phrase_blacklist[-60:]
 
-        # Keep a small pacing gap to avoid bursty provider traffic, but do not
-        # burn minutes of wall-clock time across thousands of batches.
-        time.sleep(0.15)
+        # (A fixed 0.15 s pacing sleep used to sit here; provider pacing is
+        # now the KeyPool limiter's job.)
 
     recovered = _recover_plot_summaries(
         llm=llm,

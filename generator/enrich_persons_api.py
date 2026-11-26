@@ -33,7 +33,7 @@ from contracts import (
     validate_person,
 )
 from entities_to_csv import normalize_person_record
-from llm_provider import get_llm_client
+from llm_provider import get_llm_client, ordered_map
 from model_defaults import model_for_role
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -338,12 +338,11 @@ def enrich_persons(
     total_batches = (len(pending) + batch_size - 1) // batch_size
     shard_offset = _next_shard_offset(base_dir)
 
-    for batch_idx in range(total_batches):
-        batch = pending[batch_idx * batch_size:(batch_idx + 1) * batch_size]
-        print(f"  Batch {batch_idx + 1}/{total_batches} ({len(batch)} persons)...", flush=True)
+    def _call_batch(batch: list[dict]) -> tuple[list[dict] | None, Exception | None]:
+        # Runs on a worker thread: only the LLM call and its retries. All
+        # merging below happens in batch order on the main thread, so the
+        # result does not depend on DATA_SYS_LLM_CONCURRENCY.
         prompt = _build_prompt(batch)
-
-        parsed: list[dict] | None = None
         last_error: Exception | None = None
         for attempt in range(OUTER_RETRIES):
             try:
@@ -356,8 +355,7 @@ def enrich_persons(
                     timeout_sec=90,
                     max_attempts=5,
                 )
-                parsed = _parse_json_response(response.text)
-                break
+                return _parse_json_response(response.text), None
             except Exception as exc:
                 last_error = exc
                 wait_for = _retry_sleep(attempt)
@@ -365,6 +363,11 @@ def enrich_persons(
                 if attempt + 1 < OUTER_RETRIES:
                     print(f"    Waiting {wait_for:.1f}s before retry...")
                     time.sleep(wait_for)
+        return None, last_error
+
+    batches = [pending[i * batch_size:(i + 1) * batch_size] for i in range(total_batches)]
+    for batch_idx, (batch, (parsed, last_error)) in enumerate(ordered_map(_call_batch, batches)):
+        print(f"  Batch {batch_idx + 1}/{total_batches} ({len(batch)} persons)...", flush=True)
 
         patches_by_id: dict[int, dict] = {}
         if parsed is not None:
