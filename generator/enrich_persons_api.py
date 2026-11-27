@@ -338,16 +338,24 @@ def enrich_persons(
     total_batches = (len(pending) + batch_size - 1) // batch_size
     shard_offset = _next_shard_offset(base_dir)
 
-    def _call_batch(batch: list[dict]) -> tuple[list[dict] | None, Exception | None]:
-        # Runs on a worker thread: only the LLM call and its retries. All
+    def _usable(item: object) -> bool:
+        return isinstance(item, dict) and len(str(item.get("bio", "") or "").strip()) >= 40
+
+    def _call_batch(batch: list[dict]) -> tuple[dict[int, dict], Exception | None]:
+        # Runs on a worker thread: only the LLM calls and their retries. All
         # merging below happens in batch order on the main thread, so the
         # result does not depend on DATA_SYS_LLM_CONCURRENCY.
-        prompt = _build_prompt(batch)
+        #
+        # Persons missing from a reply (or with an unusable bio) are asked
+        # for again in a smaller prompt. When every person comes back on the
+        # first attempt this makes exactly the calls the old code made.
+        patches: dict[int, dict] = {}
+        remaining = list(batch)
         last_error: Exception | None = None
         for attempt in range(OUTER_RETRIES):
             try:
                 response = llm.generate(
-                    prompt,
+                    _build_prompt(remaining),
                     model=effective_model,
                     json_mode=True,
                     temperature=0.8,
@@ -355,7 +363,7 @@ def enrich_persons(
                     timeout_sec=90,
                     max_attempts=5,
                 )
-                return _parse_json_response(response.text), None
+                parsed = _parse_json_response(response.text)
             except Exception as exc:
                 last_error = exc
                 wait_for = _retry_sleep(attempt)
@@ -363,23 +371,38 @@ def enrich_persons(
                 if attempt + 1 < OUTER_RETRIES:
                     print(f"    Waiting {wait_for:.1f}s before retry...")
                     time.sleep(wait_for)
-        return None, last_error
-
-    batches = [pending[i * batch_size:(i + 1) * batch_size] for i in range(total_batches)]
-    for batch_idx, (batch, (parsed, last_error)) in enumerate(ordered_map(_call_batch, batches)):
-        print(f"  Batch {batch_idx + 1}/{total_batches} ({len(batch)} persons)...", flush=True)
-
-        patches_by_id: dict[int, dict] = {}
-        if parsed is not None:
-            for item in parsed:
+                continue
+            wanted = {int(person["person_id"]) for person in remaining}
+            for item in parsed or []:
                 try:
                     pid = int(item.get("person_id"))
                 except Exception:
                     continue
-                if pid in by_id:
-                    patches_by_id[pid] = item
-        elif last_error is not None:
-            print(f"    Falling back for batch after repeated failure: {last_error}")
+                if pid in wanted and pid not in patches and _usable(item):
+                    patches[pid] = item
+            remaining = [person for person in remaining if int(person["person_id"]) not in patches]
+            if not remaining:
+                return patches, None
+            last_error = RuntimeError(f"{len(remaining)} persons missing or unusable in the reply")
+            print(f"    Re-requesting {len(remaining)} persons missing from the reply ({attempt + 1}/{OUTER_RETRIES})")
+        return patches, last_error
+
+    research_mode = str(os.getenv("DATA_SYS_PIPELINE_MODE", "research") or "research").strip().lower() == "research"
+    batches = [pending[i * batch_size:(i + 1) * batch_size] for i in range(total_batches)]
+    for batch_idx, (batch, (patches_by_id, last_error)) in enumerate(ordered_map(_call_batch, batches)):
+        print(f"  Batch {batch_idx + 1}/{total_batches} ({len(batch)} persons)...", flush=True)
+
+        missing = [int(p["person_id"]) for p in batch if int(p["person_id"]) not in patches_by_id]
+        if missing:
+            if research_mode:
+                # Placeholder bios would silently replace LLM text; stop
+                # instead. Finished batches are kept as shards, so a resume
+                # continues from here.
+                raise RuntimeError(
+                    f"Person enrichment batch {batch_idx + 1} still lacks {len(missing)} persons after "
+                    f"{OUTER_RETRIES} attempts (sample {missing[:5]}): {last_error}"
+                )
+            print(f"    Falling back for {len(missing)} persons after repeated failure: {last_error}")
 
         for person in batch:
             pid = int(person["person_id"])
