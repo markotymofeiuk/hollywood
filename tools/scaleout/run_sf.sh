@@ -74,6 +74,10 @@ source "$repo/.env"
 # shellcheck disable=SC1091
 source "$here/albert.env"
 set +a
+if [[ -z "${DATA_SYS_LLM_CONCURRENCY:-}" ]]; then
+  n_keys=$(tr ',' '\n' <<< "${LOCAL_LLM_API_KEYS:-${LOCAL_LLM_API_KEY:-}}" | grep -c '[^[:space:]]')
+  export DATA_SYS_LLM_CONCURRENCY=$(( 80 * (n_keys > 0 ? n_keys : 1) ))
+fi
 # Test hook: RUN_SF_FAKE=1 runs the same orchestration on the offline fake LLM.
 if [[ "${RUN_SF_FAKE:-0}" == "1" ]]; then
   export LLM_PROVIDER=fake DATA_SYS_LLM_RPM=0 DATA_SYS_LLM_TPM=0

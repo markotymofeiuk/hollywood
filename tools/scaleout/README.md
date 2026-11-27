@@ -52,7 +52,7 @@ and the commands to follow and resume it.
 
 1. creates `.venv` with uv (Python 3.12) and installs the pinned requirements;
 2. loads `.env` and `albert.env` (per-key limits 50 requests/min and 256K
-   tokens/min, 128 concurrent calls, thinking off, model pinned);
+   tokens/min, 80 concurrent calls per key, thinking off, model pinned);
 3. checks that the model is available and that every key answers;
 4. copies `generator/` into the workspace and records commit, host and
    settings in `run_manifest.jsonl`;
