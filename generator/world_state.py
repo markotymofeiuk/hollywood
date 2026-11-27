@@ -999,18 +999,27 @@ class WorldState:
         }
 
     def _graph_name_resolver(self, entity_id: int, entity_type: str) -> str:
-        entity_id = int(entity_id)
         if entity_type == "company":
-            if self.companies is not None and {"company_id", "name"}.issubset(self.companies.columns):
-                matches = self.companies.loc[self.companies["company_id"].astype(int) == entity_id, "name"]
-                if len(matches) > 0:
-                    return str(matches.iloc[0])
+            frame, id_col = self.companies, "company_id"
+        else:
+            frame, id_col = self.persons, "person_id"
+        if frame is None or not {id_col, "name"}.issubset(frame.columns):
             return ""
-        if self.persons is not None and {"person_id", "name"}.issubset(self.persons.columns):
-            matches = self.persons.loc[self.persons["person_id"].astype(int) == entity_id, "name"]
-            if len(matches) > 0:
-                return str(matches.iloc[0])
-        return ""
+        return self._graph_name_index(entity_type == "company", frame, id_col).get(int(entity_id), "")
+
+    def _graph_name_index(self, is_company: bool, frame: pd.DataFrame, id_col: str) -> dict[int, str]:
+        # id -> name of the first row with that id, the same answer as a filter
+        # on the frame. Built once per frame: the edge exports resolve two names
+        # per edge, and scanning the frame for each made them quadratic.
+        cache = self.__dict__.setdefault("_graph_name_cache", {})
+        cached = cache.get(is_company)
+        if cached is None or cached[0] is not frame or cached[1] != len(frame):
+            index: dict[int, str] = {}
+            for entity_id, name in zip(frame[id_col].astype(int).tolist(), frame["name"].tolist()):
+                index.setdefault(int(entity_id), str(name))
+            cached = (frame, len(frame), index)
+            cache[is_company] = cached
+        return cached[2]
 
     def _load_edge_graph(self):
         arrow_path = self.base_dir / "graph" / "edge_graph.arrow"
