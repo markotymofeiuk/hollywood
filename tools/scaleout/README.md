@@ -29,9 +29,21 @@ The script prints the workspace (default `~/hollywood-runs/sf0_1-<timestamp>`)
 and the commands to follow and resume it.
 
 - Follow: `tail -f <workspace>/driver.log <workspace>/run.log`
-- Resume after a crash, reboot or kill: `tools/scaleout/run_sf0_1.sh --detach --resume <workspace>`.
-  Finished steps are skipped, LLM steps continue from their saved shards and
-  step 100 continues from its last completed year.
+- The run is detached from your session and runs under `supervise.sh`: if the
+  pipeline stops with an error (network outage, API errors outlasting a step's
+  retries, a killed process) it is resumed automatically after 5 minutes, up to
+  8 times. `supervisor.log` in the workspace lists every restart.
+- Resume by hand (after a reboot, or after the supervisor gave up):
+  `tools/scaleout/run_sf0_1.sh --detach --resume <workspace>`. Finished steps are
+  skipped, LLM steps continue from their saved shards and step 100 continues
+  from its last completed year.
+- Stop on purpose: `touch <workspace>/STOP` first (otherwise the supervisor
+  resumes it), then
+  `pkill -f "[r]un_pipeline.py --profile-file"; pkill -f "<workspace>/[a-z_]*[.]py"`.
+  Remove `STOP` before resuming (`--resume` does that for you).
+- On Grid'5000 deploy nodes, keep the workspace on local disk and note that
+  Ubuntu empties `/tmp` at boot unless `/etc/tmpfiles.d/tmp.conf` contains
+  `d /tmp 1777 root root -`.
 - Another location: `--workspace /data/runs/sf0_1`.
 
 ## What it does

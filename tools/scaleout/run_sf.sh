@@ -4,8 +4,11 @@
 #   tools/scaleout/run_sf.sh <profile> [--detach] [--workspace DIR] [--resume DIR]
 #
 #   <profile>        name of tools/scaleout/profiles/<profile>.env, e.g. sf0_1
-#   --detach         keep running after you log out (nohup); setup and the API
-#                    preflight still run in the foreground so errors show up
+#   --detach         keep running after you log out (nohup), under supervise.sh,
+#                    which resumes the run automatically if it stops with an
+#                    error (up to 8 times, 5 min apart; `touch <ws>/STOP` to
+#                    prevent that). Setup and the API preflight still run in
+#                    the foreground so errors show up
 #   --workspace DIR  where to generate (default: $HOME/hollywood-runs/<profile>-<timestamp>)
 #   --resume DIR     continue an interrupted run in DIR: finished steps are skipped,
 #                    LLM steps pick up their shards, step 100 resumes at the last year
@@ -86,11 +89,14 @@ fi
 # --- 4. detach: re-run this script under nohup and return ------------------------
 if [[ $detach -eq 1 && $inner -eq 0 ]]; then
   mkdir -p "$ws"
-  if [[ $resume -eq 1 ]]; then where=(--resume "$ws"); else where=(--workspace "$ws"); fi
-  nohup env RUN_SF_FAKE="${RUN_SF_FAKE:-0}" bash "$self" "$profile" --_inner "${where[@]}" >> "$ws/driver.log" 2>&1 < /dev/null &
-  echo "started in the background (pid $!)"
+  if [[ $resume -eq 1 ]]; then first=resume; else first=new; fi
+  rm -f "$ws/STOP"
+  nohup env RUN_SF_FAKE="${RUN_SF_FAKE:-0}" bash "$here/supervise.sh" "$profile" "$ws" --start "$first" \
+    ${SUPERVISE_ARGS:-} > /dev/null 2>&1 < /dev/null &
+  echo "started in the background under supervise.sh (pid $!)"
   echo "  workspace: $ws"
-  echo "  follow:    tail -f $ws/driver.log $ws/run.log"
+  echo "  follow:    tail -f $ws/driver.log $ws/run.log $ws/supervisor.log"
+  echo "  stop:      touch $ws/STOP, then stop the processes (see README)"
   echo "  resume:    $self $profile --detach --resume $ws"
   exit 0
 fi
