@@ -88,6 +88,11 @@ _RETRIABLE_TOKENS = (
     "DEADLINEEXCEEDED", "DEADLINE_EXCEEDED", "TIMEOUT",
     "TIMED OUT", "SERVICE UNAVAILABLE", "rate limit",
     "too many requests", "overloaded",
+    # Transient server-side failures (requests' HTTPError text is
+    # "500 Server Error: Internal Server Error for url: ...").
+    "500 Server Error", "502 Server Error", "504 Server Error",
+    "Internal Server Error", "Bad Gateway", "Gateway Timeout",
+    "Connection aborted", "Connection reset", "RemoteDisconnected",
 )
 
 
@@ -272,8 +277,9 @@ def _log_llm_failure(
 
 
 def _is_retriable(exc: BaseException) -> bool:
+    # Case-insensitive: the lower-case tokens above never matched before.
     msg = str(exc).upper()
-    return any(tok in msg for tok in _RETRIABLE_TOKENS)
+    return any(tok.upper() in msg for tok in _RETRIABLE_TOKENS)
 
 
 def _call_with_timeout(fn: Callable[[], Any], timeout_sec: float) -> Any:
