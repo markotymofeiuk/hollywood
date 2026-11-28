@@ -67,6 +67,9 @@ def load_json_artifact(path: str | Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+_LAST_ARTIFACT_AUDIT: dict[str, tuple] = {}
+
+
 def _audit_paths() -> list[Path]:
     seen: set[str] = set()
     out: list[Path] = []
@@ -167,6 +170,19 @@ def audit_artifact_usage(
     target = Path(path)
     if not target.exists():
         return
+    # A call identical to the previous one for this label (same process, same
+    # step) cannot change the audit beyond its updated_at stamp, but each call
+    # re-reads, re-hashes and re-writes the audit file: ~5 times per movie in
+    # step 100. Skip those repeats.
+    repeat_key = (
+        str(target),
+        tuple(dedupe_strings(sections or [])),
+        json.dumps(extra, sort_keys=True, default=str) if extra else "",
+        str(os.getenv("DATA_SYS_STEP_ID", "") or ""),
+        tuple(str(p) for p in _audit_paths()),
+    )
+    if _LAST_ARTIFACT_AUDIT.get(str(label)) == repeat_key:
+        return
     audit = _touch_audit_root()
     artifacts = audit.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -190,7 +206,8 @@ def audit_artifact_usage(
         artifacts[str(label)] = artifact_row
     else:
         artifact_row["path"] = str(target)
-        artifact_row.setdefault("sha256", _artifact_sha256(target))
+        if "sha256" not in artifact_row:
+            artifact_row["sha256"] = _artifact_sha256(target)
         artifact_row.setdefault("consumed_steps", [])
         artifact_row.setdefault("sections_used", [])
     consumed_steps = dedupe_strings(list(artifact_row.get("consumed_steps", [])) + [str(step_bucket.get("step_id", ""))])
@@ -207,6 +224,7 @@ def audit_artifact_usage(
         step_row.update(extra)
     step_artifacts[str(label)] = step_row
     _audit_write(audit)
+    _LAST_ARTIFACT_AUDIT[str(label)] = repeat_key
 
 
 def audit_fallback_hit(

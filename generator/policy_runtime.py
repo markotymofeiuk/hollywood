@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -409,12 +410,24 @@ def write_json(path: str | Path, payload: Any) -> None:
     p.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
+_JSONL_HANDLES: dict[str, Any] = {}
+_JSONL_LOCK = threading.Lock()
+
+
 def append_jsonl(path: str | Path, row: Mapping[str, Any]) -> None:
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(dict(row), ensure_ascii=True, default=str))
-        handle.write("\n")
+    # One line-buffered append handle per path for the life of the process
+    # (step 100 appends ~370 log lines per movie): same bytes on disk, flushed
+    # at every newline as before, without an open/close per line.
+    line = json.dumps(dict(row), ensure_ascii=True, default=str) + "\n"
+    key = str(path)
+    with _JSONL_LOCK:
+        handle = _JSONL_HANDLES.get(key)
+        if handle is None or handle.closed:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            handle = p.open("a", encoding="utf-8", buffering=1)
+            _JSONL_HANDLES[key] = handle
+        handle.write(line)
 
 
 def infer_market(country: str | None) -> str:
