@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import shutil
 from array import array
 from collections import Counter, defaultdict
@@ -291,10 +292,39 @@ def _safe_int(value: Any, fallback: int) -> int:
         return int(fallback)
 
 
+# Off by default. On, large pools are sampled by drawing O(size) random positions
+# instead of RandomState.choice(replace=False), which permutes the whole pool
+# (plus a full-pool copy to drop exclude_idx): with ~0.4M-person genre pools at
+# SF1 that makes each phase quadratic in persons. The sample is still uniform
+# without replacement over the pool minus exclude_idx, but it is a different
+# random draw, so outputs differ from the default path.
+_FAST_POOL_SAMPLING = os.getenv("DATA_SYS_FAST_POOL_SAMPLING", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fast_sample_excluding(arr: np.ndarray, size: int, rng: np.random.RandomState, exclude_idx: int | None) -> np.ndarray:
+    n = int(arr.size)
+    excluded = None if exclude_idx is None else int(exclude_idx)
+    seen: set[int] = set()
+    chosen: list[int] = []
+    while len(chosen) < size:
+        for pos in rng.randint(0, n, size=size - len(chosen) + 2).tolist():
+            if pos in seen:
+                continue
+            seen.add(pos)
+            if excluded is not None and int(arr[pos]) == excluded:
+                continue
+            chosen.append(pos)
+            if len(chosen) == size:
+                break
+    return arr[np.asarray(chosen, dtype=np.int64)]
+
+
 def _sample_from_pool(pool: np.ndarray, size: int, rng: np.random.RandomState, exclude_idx: int | None = None) -> np.ndarray:
     if size <= 0 or getattr(pool, "size", 0) == 0:
         return EMPTY_I64
     arr = np.asarray(pool, dtype=np.int64)
+    if _FAST_POOL_SAMPLING and arr.size > 256 and arr.size > 4 * (size + 1):
+        return _fast_sample_excluding(arr, size, rng, exclude_idx)
     if exclude_idx is not None:
         arr = arr[arr != int(exclude_idx)]
     if arr.size == 0:
@@ -1752,6 +1782,9 @@ def _yield_person_company_batches(
     queued_counts = {edge_type: 0 for edge_type in buffers}
     stats.setdefault("counts", Counter())
     genre_basis_cache: dict[str, np.ndarray] = {}
+    # Loop-invariant (persons.controversy is never modified); computing it per
+    # person made this phase quadratic in the number of persons.
+    controversy_p60 = np.quantile(persons.controversy, 0.60) if len(persons.controversy) else 0.0
     valid_from_years = np.maximum(_active_year_lo(), persons.debut.astype(np.int32, copy=False))
     valid_to_years = np.maximum(
         persons.debut.astype(np.int32, copy=False),
@@ -1845,7 +1878,7 @@ def _yield_person_company_batches(
             buffers["employment"]["valid_from"].append(np.full(count, int(valid_from_years[idx]), dtype=np.int32))
             buffers["employment"]["valid_to"].append(np.full(count, int(valid_to_years[idx]), dtype=np.int32))
             queued_counts["employment"] += count
-        if persons.controversy[idx] > np.quantile(persons.controversy, 0.60):
+        if persons.controversy[idx] > controversy_p60:
             blacklist_scores = 0.50 * persons.controversy[idx] + 0.24 * (1.0 - controversy_fit) + 0.16 * (1.0 - risk_match) + 0.10 * (companies.market_bucket[candidates] == persons.market_bucket[idx]).astype(np.float32)
             blacklist_pick = np.flatnonzero(blacklist_scores > profile.blacklist_threshold)
             if blacklist_pick.size:
