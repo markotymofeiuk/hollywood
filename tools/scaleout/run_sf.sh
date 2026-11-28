@@ -48,6 +48,11 @@ if [[ $resume -eq 0 && -f "$ws/run_pipeline.py" ]]; then echo "$ws already holds
 log() { echo "[$(date '+%F %T')] $*"; }
 
 # --- 1. Python environment via uv ------------------------------------------------
+# The uv installer puts it in ~/.local/bin (older versions: ~/.cargo/bin), which
+# non-interactive shells such as `ssh host cmd` often lack on PATH.
+for d in "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+  if ! command -v uv >/dev/null 2>&1 && [[ -x "$d/uv" ]]; then PATH="$d:$PATH"; fi
+done
 if ! command -v uv >/dev/null 2>&1; then
   echo "uv is not installed. Install it with:  curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
   exit 1
@@ -74,6 +79,10 @@ source "$repo/.env"
 # shellcheck disable=SC1091
 source "$here/albert.env"
 set +a
+# Python randomizes str hashing per process, which changes set iteration order
+# and so some tie-breaks in the compute steps. A fixed seed makes those steps
+# reproducible (any value is as valid as another).
+export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 if [[ -z "${DATA_SYS_LLM_CONCURRENCY:-}" ]]; then
   n_keys=$(tr ',' '\n' <<< "${LOCAL_LLM_API_KEYS:-${LOCAL_LLM_API_KEY:-}}" | grep -c '[^[:space:]]')
   export DATA_SYS_LLM_CONCURRENCY=$(( 80 * (n_keys > 0 ? n_keys : 1) ))

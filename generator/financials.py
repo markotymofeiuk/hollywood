@@ -1128,8 +1128,11 @@ def _graph_synergy(world, year: int, movie_id: int, cast_ids: List[int], directo
     pairs_seen: set[tuple[int, int]] = set()
 
     graph = getattr(world, "graph", None)
-    friend_adj = getattr(world, "_friend_adj_all", None) or {}
-    rival_adj = getattr(world, "_rival_adj_all", None) or {}
+    # The adjacency maps are only read when there is no graph runtime. With a
+    # runtime they are graph views, and `view or {}` calls len() on them, which
+    # walks every node: twice per movie, a third of step 100 at SF0.1.
+    friend_adj = (getattr(world, "_friend_adj_all", None) or {}) if graph is None else {}
+    rival_adj = (getattr(world, "_rival_adj_all", None) or {}) if graph is None else {}
 
     # Traverse each cast member's friendship edges; count only intra-cast hits
     for pid in cast_set:

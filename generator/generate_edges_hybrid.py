@@ -873,6 +873,9 @@ def generate_person_person_edges(persons, latent_map, rng, max_edges_per_person=
 
     # Degree cap array for fast indexing
     cap_arr = np.array([person_cap[pid] for pid in pid_list], dtype=np.int32)
+    # at_cap[i]: person i has reached its degree cap. Degrees only grow, so once
+    # set it stays set; _classify_and_add keeps it in step with edge_count.
+    at_cap = cap_arr <= 0
     pp_style_weight = _edge_prior_float("person_person_style_weight", 0.40, lo=0.0, hi=1.0)
     pp_genre_weight = _edge_prior_float("person_person_genre_weight", 0.25, lo=0.0, hi=1.0)
     pp_risk_weight = _edge_prior_float("person_person_risk_weight", 0.15, lo=0.0, hi=1.0)
@@ -955,6 +958,10 @@ def generate_person_person_edges(persons, latent_map, rng, max_edges_per_person=
         })
         edge_count[pid_a] += 1
         edge_count[pid_b] += 1
+        if edge_count[pid_a] >= person_cap[pid_a]:
+            at_cap[i_global] = True
+        if edge_count[pid_b] >= person_cap[pid_b]:
+            at_cap[j_global] = True
         return True
 
     # ── Phase 1: Within-genre scoring with bounded-memory blocks ────────────
@@ -962,7 +969,8 @@ def generate_person_person_edges(persons, latent_map, rng, max_edges_per_person=
     # We now score each bucket in square blocks and only retain passing pairs.
     phase1_started = time.perf_counter()
     phase1_pairs = 0
-    phase1_candidates = 0
+    phase1_candidates = 0  # counted in scored blocks only
+    phase1_blocks_skipped = 0
     phase1_block_size = 1024
     for pg, bucket_idxs in genre_buckets.items():
         bucket_size = len(bucket_idxs)
@@ -1006,6 +1014,17 @@ def generate_person_person_edges(persons, latent_map, rng, max_edges_per_person=
                 bonus_right = genre_bonus_b[right_start:right_stop]
                 sums_right = gsums_b[right_start:right_stop]
 
+                # Persons at their cap now stay there, and the loop below skips
+                # every pair that has one. If one side of the block is entirely
+                # at cap, no pair here can become an edge: skip the scoring but
+                # draw the block's noise so the random stream stays identical.
+                open_left = ~at_cap[left_idx]
+                open_right = ~at_cap[right_idx]
+                if not (open_left.any() and open_right.any()):
+                    rng.rand(left_stop - left_start, right_stop - right_start)
+                    phase1_blocks_skipped += 1
+                    continue
+
                 style_block = np.clip(csv_left @ csv_right.T, 0.0, 1.0)
                 overlap_block = gnr_left @ gnr_right.T
                 union_block = sums_left[:, None] + sums_right[None, :] - overlap_block
@@ -1036,6 +1055,10 @@ def generate_person_person_edges(persons, latent_map, rng, max_edges_per_person=
                 phase1_candidates += int(ai_local.size)
                 scores = p_edge_block[ai_local, bi_local].astype(np.float32, copy=False)
                 order = np.argsort(-scores, kind="mergesort")
+                # Same reasoning per pair: drop pairs with an endpoint at cap when
+                # the block starts (the loop would skip them; order is kept). With
+                # one large genre bucket almost every pair is such a pair.
+                order = order[open_left[ai_local[order]] & open_right[bi_local[order]]]
 
                 for k in order:
                     i_g = int(left_idx[int(ai_local[k])])
@@ -1067,7 +1090,7 @@ def generate_person_person_edges(persons, latent_map, rng, max_edges_per_person=
 
     phase1_elapsed = time.perf_counter() - phase1_started
     print(f"  Phase 1 (within-genre, {len(genre_buckets)} buckets, vectorized): "
-          f"{phase1_pairs:,} pairs, {phase1_candidates:,} candidates -> {len(edges)} edges in {phase1_elapsed:.2f}s")
+          f"{phase1_pairs:,} pairs, {phase1_candidates:,} candidates ({phase1_blocks_skipped:,} blocks skipped at cap) -> {len(edges)} edges in {phase1_elapsed:.2f}s")
 
     # ── Phase 2: Cross-genre bridges (sparse inter-community connections) ─────
     # j > i ensures each cross-genre pair is evaluated exactly once.
@@ -1158,6 +1181,7 @@ def generate_person_person_edges(persons, latent_map, rng, max_edges_per_person=
         "phase1_block_size": int(phase1_block_size),
         "phase1_pairs": int(phase1_pairs),
         "phase1_candidates": int(phase1_candidates),
+        "phase1_blocks_skipped": int(phase1_blocks_skipped),
         "phase1_edges": int(p2_before),
         "phase1_elapsed_sec": round(float(phase1_elapsed), 4),
         "phase2_candidate_pairs": int(phase2_candidate_pairs),

@@ -1367,6 +1367,13 @@ def _run_step(step: dict, args: argparse.Namespace) -> bool:
         return False
 
     cmd = [sys.executable, str(script_path)] + list(step["args"])
+    # DATA_SYS_PROFILE_STEPS=80,100 runs those steps under cProfile and writes
+    # profiles/step<ID>.prof in the workspace (read it with pstats or snakeviz).
+    profile_steps = {s.strip() for s in os.environ.get("DATA_SYS_PROFILE_STEPS", "").split(",") if s.strip()}
+    if str(step["id"]) in profile_steps:
+        profile_dir = BASE_DIR / "profiles"
+        profile_dir.mkdir(exist_ok=True)
+        cmd = [sys.executable, "-m", "cProfile", "-o", str(profile_dir / f"step{step['id']}.prof"), *cmd[1:]]
     print(f"\n{'=' * 72}")
     print(f"STEP {step['id']}: {step['name']}")
     print(step["description"])
