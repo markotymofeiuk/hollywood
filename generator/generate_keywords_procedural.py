@@ -756,6 +756,28 @@ def generate_keywords(target: int, *, seed: int, base_dir: Path, mode: str) -> l
             ]
         )
         rng.shuffle(generic_pool)
+        if generic_budget > len(generic_pool):
+            # The capped combinations above hold ~1.6K keywords, short of the
+            # generic budget from about 9K target keywords up (4.2K at SF1, 42K
+            # at SF10). Only then, append the same combinations over the full
+            # lists. Smaller runs keep the exact pool and random stream above.
+            seen_generic = {kw.casefold() for kw in generic_pool}
+            extra_pool = [
+                kw
+                for kw in _dedupe_keep_order(
+                    [f"{qualifier}-{theme}" for qualifier in universal_qualifiers for theme in generic_themes]
+                    + [f"{theme}-{context}" for theme in generic_themes for context in universal_contexts]
+                    + [
+                        f"{qualifier}-{theme}-{context}"
+                        for qualifier in universal_qualifiers
+                        for theme in generic_themes
+                        for context in universal_contexts
+                    ]
+                )
+                if kw.casefold() not in seen_generic
+            ]
+            rng.shuffle(extra_pool)
+            generic_pool.extend(extra_pool)
         for kw in generic_pool:
             if len(keywords) >= target or current_bucket_counts["generic"] >= generic_budget:
                 break

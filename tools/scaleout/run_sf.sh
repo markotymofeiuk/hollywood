@@ -119,6 +119,15 @@ if [[ $resume -eq 1 ]]; then
   log "resuming in $ws"
 else
   "$here/make_workspace.sh" "$ws"
+  # A profile can name a set of bootstrap artifacts (tools/scaleout/artifacts/<set>/)
+  # that replace the shipped ones, e.g. the larger company lexicon SF1/SF10 need.
+  artifact_set=$(sed -n 's/^SCALEOUT_ARTIFACTS=//p' "$profile_file" | tail -1)
+  if [[ -n "$artifact_set" ]]; then
+    for f in "$here/artifacts/$artifact_set"/*.json; do
+      cp "$f" "$ws/$(basename "$f")"
+      log "artifact $(basename "$f") from artifacts/$artifact_set"
+    done
+  fi
 fi
 REPO_DIR="$repo" "$py" - "$ws" "$profile" "$resume" <<'PY'
 import json, os, platform, subprocess, sys, time

@@ -1,0 +1,209 @@
+{
+  "prefixes": [
+    "Aurora",
+    "Beacon",
+    "Blue",
+    "Bright",
+    "Cascade",
+    "Celestial",
+    "Crimson",
+    "Dark",
+    "Deep",
+    "Delta",
+    "Dream",
+    "Echo",
+    "Emerald",
+    "Ever",
+    "Fable",
+    "Falcon",
+    "Fen",
+    "Fire",
+    "First",
+    "Fusion",
+    "Golden",
+    "Grand",
+    "Harbor",
+    "High",
+    "Horizon",
+    "Iron",
+    "Ivory",
+    "Jade",
+    "Kite",
+    "Last",
+    "Lighthouse",
+    "Lion",
+    "Lone",
+    "Lunar",
+    "Maple",
+    "Meridian",
+    "Midnight",
+    "Mirage",
+    "Misty",
+    "Moon",
+    "North",
+    "Ocean",
+    "Onyx",
+    "Orbit",
+    "Palm",
+    "Pine",
+    "Pioneer",
+    "Prism",
+    "Quantum",
+    "Red",
+    "Ridge",
+    "Rising",
+    "River",
+    "Royal",
+    "Ruby",
+    "Sapphire",
+    "Scarlet",
+    "Shadow",
+    "Silver",
+    "Sky",
+    "Solar",
+    "South",
+    "Star",
+    "Stone",
+    "Storm",
+    "Sun",
+    "Sunset",
+    "Temple",
+    "Thunder",
+    "Tide",
+    "Titan",
+    "True",
+    "Unity",
+    "Valiant",
+    "Vanguard",
+    "Violet",
+    "Wild",
+    "Willow",
+    "Windsor",
+    "Wolfe",
+    "Zenith"
+  ],
+  "suffixes": [
+    "Pictures",
+    "Studios",
+    "Films",
+    "Entertainment",
+    "Media",
+    "Productions",
+    "Cinema",
+    "Group",
+    "Works",
+    "Labs",
+    "Collective",
+    "Ventures"
+  ],
+  "abstract_nouns": [
+    "Vision",
+    "Horizon",
+    "Echo",
+    "Signal",
+    "Legacy",
+    "Canvas",
+    "Story",
+    "Pulse",
+    "Summit",
+    "Frontier",
+    "Myth",
+    "Orbit"
+  ],
+  "material_words": [
+    "Silver",
+    "Golden",
+    "Ivory",
+    "Amber",
+    "Cobalt",
+    "Steel"
+  ],
+  "geographic_words": [
+    "Harbor",
+    "Coast",
+    "Frontier",
+    "Skyline",
+    "Summit",
+    "Valley"
+  ],
+  "motion_words": [
+    "Pulse",
+    "Transit",
+    "Orbit",
+    "Drift",
+    "Ascent",
+    "Voyage"
+  ],
+  "mythic_words": [
+    "Phoenix",
+    "Atlas",
+    "Oracle",
+    "Mirage",
+    "Titan",
+    "Avalon"
+  ],
+  "templates": [
+    "{prefix} {suffix}",
+    "{prefix} {abstract} {suffix}",
+    "{geo} {prefix} {suffix}",
+    "{motion} {abstract} {suffix}",
+    "{mythic} {suffix}"
+  ],
+  "tier_styles": {
+    "Global": [
+      "broad",
+      "prestige",
+      "corporate"
+    ],
+    "Major": [
+      "polished",
+      "commercial",
+      "confident"
+    ],
+    "Mid-Budget": [
+      "nimble",
+      "genre-forward",
+      "modern"
+    ],
+    "Indie": [
+      "artful",
+      "personal",
+      "distinctive"
+    ],
+    "Micro": [
+      "scrappy",
+      "inventive",
+      "local"
+    ]
+  },
+  "country_style_bias": {
+    "USA": [
+      "bold",
+      "studio-scale"
+    ],
+    "UK": [
+      "prestige",
+      "heritage"
+    ],
+    "India": [
+      "epic",
+      "musicality"
+    ],
+    "France": [
+      "art-house",
+      "elegant"
+    ],
+    "Japan": [
+      "precise",
+      "stylized"
+    ]
+  },
+  "meta": {
+    "schema_version": 1,
+    "artifact": "company_lexicon",
+    "generator_mode": "llm",
+    "model": "gemini-3.1-flash-lite",
+    "model_note": "generated with deepseek-v4-flash-0731 on the Albert API (DATA_SYS_LLM_PIN_MODEL=1); 'model' is the id the step requested",
+    "prompt_context": "SF1 targets: 214,500 movies, 514,800 persons, 19,300 companies, 23,400 keywords, 278,900 titles, 2000-2050"
+  }
+}
