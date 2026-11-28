@@ -1451,6 +1451,8 @@ class CastYearCache:
     style_match_cache: dict[tuple[str, ...], np.ndarray] = field(default_factory=dict)
     market_match_cache: dict[str, np.ndarray] = field(default_factory=dict)
     avoid_genre_cache: dict[str, np.ndarray] = field(default_factory=dict)
+    # ";".join(sorted(tags)) per actor, built once per year instead of per concept.
+    actor_style_joined: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -1464,6 +1466,8 @@ class CrewYearPool:
     genre_match_cache: dict[str, np.ndarray] = field(default_factory=dict)
     genre_weight_cache: dict[str, np.ndarray] = field(default_factory=dict)
     genre_band_cache: dict[str, np.ndarray] = field(default_factory=dict)
+    # _to_str_ndarray(genre_affinity_lower), converted once per pool instead of once per genre.
+    genre_affinity_str: np.ndarray | None = None
 
 
 @dataclass(slots=True)
@@ -1782,7 +1786,9 @@ def _crew_genre_match_mask(pool: CrewYearPool, genre: str) -> np.ndarray:
     cached = pool.genre_match_cache.get(genre_key)
     if cached is not None:
         return cached
-    mask = np.char.find(_to_str_ndarray(pool.genre_affinity_lower), genre_key) >= 0
+    if pool.genre_affinity_str is None:
+        pool.genre_affinity_str = _to_str_ndarray(pool.genre_affinity_lower)
+    mask = np.char.find(pool.genre_affinity_str, genre_key) >= 0
     pool.genre_match_cache[genre_key] = mask
     return mask
 
@@ -2112,7 +2118,7 @@ def _build_actor_static_block(world: WorldState, concept: dict) -> ActorStaticBl
     else:
         style_mult = np.ones(n, dtype=float)
     if policy_enabled and cache.actor_tag_sets is not None:
-        actor_tag_sets = [cache.actor_tag_sets[int(i)] for i in candidate_idx] if cache.actor_tag_sets is not None else None
+        actor_tag_sets = [cache.actor_tag_sets[i] for i in candidate_idx.tolist()] if cache.actor_tag_sets is not None else None
 
     avoid_genre_mult = np.ones(n, dtype=float)
     sparse_avoid = getattr(world, "_latent_avoid_genres", None)
@@ -2232,7 +2238,9 @@ def _build_actor_static_block(world: WorldState, concept: dict) -> ActorStaticBl
     if policy_enabled:
         style_values = None
         if actor_tag_sets is not None:
-            style_values = np.asarray([";".join(sorted(tags)) for tags in actor_tag_sets], dtype=object)
+            if cache.actor_style_joined is None:
+                cache.actor_style_joined = np.asarray([";".join(sorted(tags)) for tags in cache.actor_tag_sets], dtype=object)
+            style_values = cache.actor_style_joined[candidate_idx]
         policy_rule_mult = _person_policy_rule_multiplier(
             world,
             pids,
@@ -2256,7 +2264,7 @@ def _build_actor_static_block(world: WorldState, concept: dict) -> ActorStaticBl
         actor_nationalities=actor_nats,
         actor_tag_sets=actor_tag_sets,
         actor_tag_bitmasks=actor_tag_bitmasks,
-        pid_to_idx={int(pid): i for i, pid in enumerate(pids)},
+        pid_to_idx=dict(zip(pids.tolist(), range(len(pids)))),
         top_star_mask=top_star_mask,
         cand_agencies=cand_agencies,
         cand_communities=cand_communities,
@@ -3024,6 +3032,66 @@ def sample_movie_concept(world: WorldState, movie_id: int, forced_year: int = No
     return concept
 
 
+def _director_year_view(world: WorldState, year: int) -> dict:
+    """Per-year arrays pick_director used to rebuild for every movie.
+
+    world.directors is fixed after load, so the active subset and its static
+    columns depend only on the year. Film counts and recent-year counts change
+    only through _note_director_used, which updates them in place. The view is
+    rebuilt from the source dicts whenever the year or any source object
+    (directors frame, counters, latent index) changes, e.g. after a resume.
+    """
+    view = getattr(world, "_director_view", None)
+    sources = (world.directors, world.director_film_count, getattr(world, "director_recent", None), getattr(world, "_latent_pid_to_idx", None))
+    if view is not None and view["year"] == year and all(a is b for a, b in zip(view["sources"], sources)):
+        return view
+    dirs = _active_year_subset(world.directors, year)
+    if "debut_year" in dirs.columns:
+        span = year - dirs["debut_year"].fillna(1970).astype(int)
+        soft = dirs[(span >= 0) & (span <= 60)]
+        if len(soft) >= 3:
+            dirs = soft
+    dir_pids = dirs["person_id"].astype(int).values
+    director_recent = getattr(world, "director_recent", {}) or {}
+    view = {
+        "year": year,
+        "sources": sources,
+        "dirs": dirs,
+        "pop_weight": dirs["pop_weight"].astype(float).values,
+        "ga_lower": dirs["genre_affinity"].fillna("").astype(str).str.lower() if "genre_affinity" in dirs.columns else None,
+        "genre_masks": {},
+        "dir_country": (
+            np.array([_NATIONALITY_TO_COUNTRY.get(n, "") for n in dirs["nationality"].fillna("").astype(str).values])
+            if "nationality" in dirs.columns else None
+        ),
+        "dir_pids": dir_pids,
+        "pos": {int(pid): i for i, pid in enumerate(dir_pids.tolist())},
+        "film_counts": np.array([world.director_film_count.get(int(pid), 0) for pid in dir_pids], dtype=float),
+        "recent_window": np.array(
+            [sum(1 for seen_year in director_recent.get(int(pid), []) if abs(int(seen_year) - year) <= 3) for pid in dir_pids],
+            dtype=float,
+        ),
+    }
+    world._director_view = view
+    return view
+
+
+def _note_director_used(world: WorldState, did: int, year: int, *, recent: bool) -> None:
+    """Mirror a director_film_count (+1) and, if recent, a director_recent append in the view."""
+    view = getattr(world, "_director_view", None)
+    if view is None:
+        return
+    pos = view["pos"].get(int(did))
+    if pos is None:
+        return
+    view["film_counts"][pos] += 1.0
+    if recent:
+        if view["year"] == int(year):
+            view["recent_window"][pos] += 1.0  # the appended year is the view's year: |year - year| <= 3
+        else:
+            world._director_view = None
+
+
 def pick_director(world: WorldState, concept: dict) -> int | None:
     if len(world.directors) == 0:
         return None
@@ -3038,35 +3106,25 @@ def pick_director(world: WorldState, concept: dict) -> int | None:
     if franchise and franchise.get("director_id") is not None and world.rng.random() < carryover_director_bias:
         return int(franchise["director_id"])
 
-    dirs = _active_year_subset(world.directors, year)
-    if "debut_year" in dirs.columns:
-        span = year - dirs["debut_year"].fillna(1970).astype(int)
-        soft = dirs[(span >= 0) & (span <= 60)]
-        if len(soft) >= 3:
-            dirs = soft
-
-    weights = dirs["pop_weight"].astype(float).values.copy()
-    if "genre_affinity" in dirs.columns:
-        ga = dirs["genre_affinity"].fillna("").astype(str).str.lower()
-        weights *= np.where(ga.str.contains(genre.lower(), regex=False).values, float(director_cfg["genre_match_boost"]), 1.0)
+    view = _director_year_view(world, year)
+    dirs = view["dirs"]
+    weights = view["pop_weight"].copy()
+    if view["ga_lower"] is not None:
+        genre_key = genre.lower()
+        genre_mask = view["genre_masks"].get(genre_key)
+        if genre_mask is None:
+            genre_mask = view["ga_lower"].str.contains(genre_key, regex=False).values
+            view["genre_masks"][genre_key] = genre_mask
+        weights *= np.where(genre_mask, float(director_cfg["genre_match_boost"]), 1.0)
 
     movie_country = str(concept.get("country", ""))
-    if movie_country and "nationality" in dirs.columns:
-        nat = dirs["nationality"].fillna("").astype(str).values
-        dir_country = np.array([_NATIONALITY_TO_COUNTRY.get(n, "") for n in nat])
+    if movie_country and view["dir_country"] is not None:
         geo_boost = _geo_boost_for_tier(world, tier, 2.0) * float(director_cfg["geo_boost_scale"])
-        weights *= np.where(dir_country == movie_country, max(float(director_cfg["geo_boost_floor"]), geo_boost), 1.0)
+        weights *= np.where(view["dir_country"] == movie_country, max(float(director_cfg["geo_boost_floor"]), geo_boost), 1.0)
 
-    dir_pids = dirs["person_id"].astype(int).values
-    film_counts = np.array([world.director_film_count.get(int(pid), 0) for pid in dir_pids], dtype=float)
-    director_recent = getattr(world, "director_recent", {}) or {}
-    recent_window = np.array(
-        [
-            sum(1 for seen_year in director_recent.get(int(pid), []) if abs(int(seen_year) - year) <= 3)
-            for pid in dir_pids
-        ],
-        dtype=float,
-    )
+    dir_pids = view["dir_pids"]
+    film_counts = view["film_counts"].copy()
+    recent_window = view["recent_window"].copy()
     target_director_load = _prior_float(world, "target_director_load", 7.5, lo=2.0, hi=40.0)
     experience_bonus = np.clip(1.0 + 0.05 * np.log1p(np.minimum(film_counts, 8.0)), 1.0, 1.12)
     load_ratio = film_counts / max(target_director_load, 1.0)
@@ -3222,6 +3280,7 @@ def pick_director(world: WorldState, concept: dict) -> int | None:
     world.director_film_count[did] += 1
     if hasattr(world, "director_recent"):
         world.director_recent[did].append(int(year))
+    _note_director_used(world, did, year, recent=hasattr(world, "director_recent"))
     return did
 
 
@@ -3244,7 +3303,65 @@ def pick_co_director(world: WorldState, concept: dict, primary_dir_id: int) -> i
     chosen = int(world.rng.choice(len(dirs), p=probs))
     did = int(dirs.iloc[chosen]["person_id"])
     world.director_film_count[did] += 1
+    _note_director_used(world, did, int(concept.get("year", 2000)), recent=False)
     return did
+
+
+def _company_year_view(world: WorldState, year: int) -> dict:
+    """Per-year arrays pick_companies used to rebuild for every movie.
+
+    Within a year world.companies changes only through llm_master's company
+    actions, which clear this view; film and recent counts change only through
+    _note_company_used. Rebuilt when the year or a source object changes.
+    """
+    view = getattr(world, "_company_view", None)
+    sources = (world.companies, world.company_film_count, getattr(world, "company_recent", None))
+    if view is not None and view["year"] == year and all(a is b for a, b in zip(view["sources"], sources)):
+        return view
+    comps = world.companies
+    active = comps
+    if "founded_year" in active.columns:
+        active = active[active["founded_year"].fillna(0).astype(int) <= year]
+    if "defunct_year" in active.columns:
+        active = active[active["defunct_year"].isna() | (active["defunct_year"].fillna(2100).astype(float) >= float(year))]
+    if len(active) < 3:
+        active = comps
+    cids_all = active["company_id"].astype(int).values
+    company_recent = getattr(world, "company_recent", {}) or {}
+    view = {
+        "year": year,
+        "sources": sources,
+        "active": active,
+        "pop_weight": active["pop_weight"].astype(float).values,
+        "tier_values": active["tier"].astype(str).values if "tier" in active.columns else None,
+        "sg_lower": active["specialty_genres"].fillna("").astype(str).str.lower() if "specialty_genres" in active.columns else None,
+        "genre_masks": {},
+        "cids_all": cids_all,
+        "pos": {int(cid): i for i, cid in enumerate(cids_all.tolist())},
+        "film_counts": np.array([world.company_film_count.get(int(cid), 0) for cid in cids_all], dtype=float),
+        "recent_window": np.array(
+            [sum(1 for seen_year in company_recent.get(int(cid), []) if abs(int(seen_year) - year) <= 4) for cid in cids_all],
+            dtype=float,
+        ),
+    }
+    world._company_view = view
+    return view
+
+
+def _note_company_used(world: WorldState, cid: int, year: int, *, recent: bool) -> None:
+    """Mirror a company_film_count (+1) and, if recent, a company_recent append in the view."""
+    view = getattr(world, "_company_view", None)
+    if view is None:
+        return
+    pos = view["pos"].get(int(cid))
+    if pos is None:
+        return
+    view["film_counts"][pos] += 1.0
+    if recent:
+        if view["year"] == int(year):
+            view["recent_window"][pos] += 1.0  # appended year is the view's year: |year - year| <= 4
+        else:
+            world._company_view = None
 
 
 def pick_companies(world: WorldState, concept: dict, director_id: int) -> list[dict]:
@@ -3264,41 +3381,31 @@ def pick_companies(world: WorldState, concept: dict, director_id: int) -> list[d
         if rows:
             return rows
 
-    active = comps
-    if "founded_year" in active.columns:
-        active = active[active["founded_year"].fillna(0).astype(int) <= year]
-    if "defunct_year" in active.columns:
-        active = active[active["defunct_year"].isna() | (active["defunct_year"].fillna(2100).astype(float) >= float(year))]
-    if len(active) < 3:
-        active = comps
+    view = _company_year_view(world, year)
+    active = view["active"]
 
     n_companies = int(world.rng.choice([1, 1, 2, 2, 3]))
     n_companies = min(n_companies, len(active))
-    weights = active["pop_weight"].astype(float).values.copy()
+    weights = view["pop_weight"].copy()
     company_tier_match_boost = _section_prior_float(world, "selection_weights", "company_tier_match_boost", 8.0, lo=1.0, hi=20.0)
     company_tier_mismatch_penalty = _section_prior_float(world, "selection_weights", "company_tier_mismatch_penalty", 0.2, lo=0.01, hi=2.0)
     company_genre_match_boost = _section_prior_float(world, "selection_weights", "company_genre_match_boost", 15.0, lo=1.0, hi=30.0)
     company_genre_mismatch_penalty = _section_prior_float(world, "selection_weights", "company_genre_mismatch_penalty", 0.25, lo=0.01, hi=2.0)
 
-    if "tier" in active.columns:
-        tier_match = active["tier"].astype(str).values == tier
+    if view["tier_values"] is not None:
+        tier_match = view["tier_values"] == tier
         weights *= np.where(tier_match, company_tier_match_boost, company_tier_mismatch_penalty)
-    if "specialty_genres" in active.columns:
-        sg = active["specialty_genres"].fillna("").astype(str).str.lower()
-        match = sg.str.contains(genre.lower(), regex=False).values
+    if view["sg_lower"] is not None:
+        genre_key = genre.lower()
+        match = view["genre_masks"].get(genre_key)
+        if match is None:
+            match = view["sg_lower"].str.contains(genre_key, regex=False).values
+            view["genre_masks"][genre_key] = match
         weights *= np.where(match, company_genre_match_boost, company_genre_mismatch_penalty)
 
     target_company_load = _prior_float(world, "target_company_load", 10.5, lo=2.0, hi=60.0)
-    cids_all = active["company_id"].astype(int).values
-    company_film_counts = np.array([world.company_film_count.get(int(cid), 0) for cid in cids_all], dtype=float)
-    company_recent = getattr(world, "company_recent", {}) or {}
-    company_recent_window = np.array(
-        [
-            sum(1 for seen_year in company_recent.get(int(cid), []) if abs(int(seen_year) - year) <= 4)
-            for cid in cids_all
-        ],
-        dtype=float,
-    )
+    company_film_counts = view["film_counts"].copy()
+    company_recent_window = view["recent_window"].copy()
     weights *= _company_usage_multiplier(
         company_film_counts,
         company_recent_window,
@@ -3437,6 +3544,7 @@ def pick_companies(world: WorldState, concept: dict, director_id: int) -> list[d
         world.company_film_count[cid] += 1
         if hasattr(world, "company_recent"):
             world.company_recent[cid].append(int(year))
+        _note_company_used(world, cid, year, recent=hasattr(world, "company_recent"))
         rows.append({"company_id": cid, "role": "Production" if pos == 0 else "Co-Production"})
     _log_selection_decision(
         world,
@@ -5638,6 +5746,105 @@ def _year_slate_family_boosts(world: WorldState, terms: Sequence[str]) -> dict[s
     return boosts
 
 
+def _keyword_static_view(world: WorldState) -> dict:
+    """Per-keyword arrays pick_keywords used to rebuild for every movie.
+
+    world.keywords is fixed during step 100, so these depend only on it (the
+    view is rebuilt if the frame object changes). Genre, search-term and
+    company-genre masks are cached on first use; usage counts are mirrored in
+    an array updated by _note_keyword_used.
+    """
+    kw = world.keywords
+    view = getattr(world, "_keyword_view", None)
+    if view is not None and view["src"] is kw:
+        return view
+    n = len(kw)
+    keyword_text_raw = kw["keyword"].fillna("").astype(str) if "keyword" in kw.columns else pd.Series([""] * n)
+    keyword_text = keyword_text_raw.str.lower()
+    weights = kw["pop_weight"].astype(float).values.copy() if "pop_weight" in kw.columns else np.ones(n, dtype=float)
+    if "topic_genre" in kw.columns:
+        kw_topic = np.array([_canonical_genre_label(value) for value in kw["topic_genre"].fillna("").astype(str).values], dtype=object)
+    else:
+        kw_topic = np.array([""] * n, dtype=object)
+    has_bucket = "selection_bucket" in kw.columns
+    if has_bucket:
+        bucket_labels = kw["selection_bucket"].fillna("").astype(str).str.strip().str.lower().to_numpy(dtype=object)
+    else:
+        bucket_labels = np.array([""] * n, dtype=object)
+    motif_family = kw["motif_family"].fillna("").astype(str).values if "motif_family" in kw.columns else np.array([""] * n, dtype=object)
+    specificity = kw["specificity_tier"].fillna(2).astype(int).values if "specificity_tier" in kw.columns else np.full(n, 2, dtype=int)
+    view = {
+        "src": kw,
+        "keyword_ids": kw["keyword_id"].astype(int).values if "keyword_id" in kw.columns else np.arange(1, n + 1, dtype=int),
+        "keyword_values": keyword_text.astype(str).tolist(),
+        "keyword_text_raw": [str(value) for value in keyword_text_raw.tolist()],
+        "base_weights": np.clip(weights, 1e-6, None),
+        "kw_topic": kw_topic,
+        "has_bucket": has_bucket,
+        "bucket_labels": bucket_labels,
+        "motif_family": motif_family,
+        "specificity": specificity,
+        "scope_hint": kw["scope_hint"].fillna("").astype(str).values if "scope_hint" in kw.columns else np.array([""] * n, dtype=object),
+        "franchise_affinity": kw["franchise_affinity"].fillna(0.0).astype(float).values if "franchise_affinity" in kw.columns else np.zeros(n, dtype=float),
+        "recurrence_strength": kw["recurrence_strength"].fillna(0.0).astype(float).values if "recurrence_strength" in kw.columns else np.zeros(n, dtype=float),
+        "generic_motif_mask": (bucket_labels == "generic") | ((bucket_labels == "") & (specificity <= 2) & np.isin(motif_family, np.array(["genre", "tone"], dtype=object))),
+        "specific_story_mask": (bucket_labels == "story_specific") | ((bucket_labels == "") & (specificity >= 3)),
+        "exact_anchor_mask": bucket_labels == "exact_anchor",
+        "related_support_mask": bucket_labels == "related_support",
+        "genre_masks": {},
+        "term_matches": {},
+        "company_masks": {},
+        "usage_src": None,
+        "usage": None,
+    }
+    view["pos"] = {int(kid): i for i, kid in enumerate(view["keyword_ids"].tolist())}
+    world._keyword_view = view
+    return view
+
+
+def _keyword_genre_masks(view: dict, genre: str, related_genres: set[str]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    key = (genre, tuple(sorted(related_genres)))
+    cached = view["genre_masks"].get(key)
+    if cached is None:
+        kw_topic = view["kw_topic"]
+        exact_genre_mask = kw_topic == genre if genre else np.zeros(len(kw_topic), dtype=bool)
+        related_genre_mask = np.array([(bool(topic) and topic in related_genres) for topic in kw_topic], dtype=bool)
+        primary_related_mask = exact_genre_mask | related_genre_mask
+        off_genre_mask = np.array([(bool(topic) and not bool(primary_related_mask[idx])) for idx, topic in enumerate(kw_topic)], dtype=bool)
+        cached = (exact_genre_mask, related_genre_mask, primary_related_mask, off_genre_mask)
+        view["genre_masks"][key] = cached
+    return cached
+
+
+def _keyword_term_matches(view: dict, term: str) -> np.ndarray:
+    matches = view["term_matches"].get(term)
+    if matches is None:
+        values = view["keyword_values"]
+        matches = np.fromiter((term in value for value in values), dtype=bool, count=len(values))
+        if len(view["term_matches"]) >= 4096:
+            view["term_matches"].clear()
+        view["term_matches"][term] = matches
+    return matches
+
+
+def _keyword_usage_array(world: WorldState, view: dict) -> np.ndarray:
+    counts = world._keyword_usage_counts
+    if view["usage_src"] is not counts:
+        view["usage"] = np.array([counts.get(int(kid), 0) for kid in view["keyword_ids"]], dtype=float)
+        view["usage_src"] = counts
+    return view["usage"]
+
+
+def _note_keyword_used(world: WorldState, kid: int) -> None:
+    """Mirror a _keyword_usage_counts[kid] += 1 in the keyword view."""
+    view = getattr(world, "_keyword_view", None)
+    if view is None or view["usage_src"] is not getattr(world, "_keyword_usage_counts", None):
+        return
+    pos = view["pos"].get(int(kid))
+    if pos is not None:
+        view["usage"][pos] += 1.0
+
+
 def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: list | None = None) -> list[int]:
     def _kw_trace(stage: str, **extra: Any) -> None:
         path = getattr(world, "movie_progress_log_path", None)
@@ -5677,22 +5884,15 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
     if not hasattr(world, "_keyword_usage_counts"):
         world._keyword_usage_counts = defaultdict(int)
 
-    keyword_ids = kw["keyword_id"].astype(int).values if "keyword_id" in kw.columns else np.arange(1, len(kw) + 1, dtype=int)
-    keyword_text_raw = kw["keyword"].fillna("").astype(str) if "keyword" in kw.columns else pd.Series([""] * len(kw))
-    keyword_text = keyword_text_raw.str.lower()
-    weights = kw["pop_weight"].astype(float).values.copy() if "pop_weight" in kw.columns else np.ones(len(kw), dtype=float)
-    weights = np.clip(weights, 1e-6, None)
+    view = _keyword_static_view(world)
+    keyword_ids = view["keyword_ids"]
+    weights = view["base_weights"].copy()
 
     genre = _canonical_genre_label(str(concept.get("genre", "Drama")))
     related_genres = _keyword_related_genres(world, genre)
-    if "topic_genre" in kw.columns:
-        kw_topic = np.array([_canonical_genre_label(value) for value in kw["topic_genre"].fillna("").astype(str).values], dtype=object)
-    else:
-        kw_topic = np.array([""] * len(kw), dtype=object)
-    if "selection_bucket" in kw.columns:
-        bucket_labels = kw["selection_bucket"].fillna("").astype(str).str.strip().str.lower().to_numpy(dtype=object)
-    else:
-        bucket_labels = np.array([""] * len(kw), dtype=object)
+    kw_topic = view["kw_topic"]
+    bucket_labels = view["bucket_labels"]
+    if not view["has_bucket"]:
         if current_mode() == "research":
             audit_fallback_hit(
                 "assembly.keyword_selection",
@@ -5701,10 +5901,7 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
                 mode="research",
             )
             raise RuntimeError("keyword.csv missing selection_bucket in research mode")
-    exact_genre_mask = kw_topic == genre if genre else np.zeros(len(kw), dtype=bool)
-    related_genre_mask = np.array([(bool(topic) and topic in related_genres) for topic in kw_topic], dtype=bool)
-    primary_related_mask = exact_genre_mask | related_genre_mask
-    off_genre_mask = np.array([(bool(topic) and not bool(primary_related_mask[idx])) for idx, topic in enumerate(kw_topic)], dtype=bool)
+    exact_genre_mask, related_genre_mask, primary_related_mask, off_genre_mask = _keyword_genre_masks(view, genre, related_genres)
     if genre:
         weights *= np.where(exact_genre_mask, float(keyword_cfg["exact_genre_boost"]), 1.0)
         weights *= np.where(~exact_genre_mask & related_genre_mask, float(keyword_cfg["family_genre_boost"]), 1.0)
@@ -5734,10 +5931,8 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
             break
     concept_mask = np.zeros(len(kw), dtype=float)
     if lexical_terms and "keyword" in kw.columns:
-        keyword_values = keyword_text.astype(str).tolist()
         for term in lexical_terms:
-            matches = np.fromiter((1.0 if term in value else 0.0 for value in keyword_values), dtype=float, count=len(keyword_values))
-            concept_mask += matches
+            concept_mask += _keyword_term_matches(view, term)  # bool adds as 1.0 / 0.0
         if concept_mask.any():
             weights *= 1.0 + float(keyword_cfg["lexical_match_scale"]) * np.clip(concept_mask, 0.0, float(keyword_cfg["lexical_match_cap"]))
     _kw_trace(
@@ -5746,15 +5941,15 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
         lexical_match_count=int(np.count_nonzero(concept_mask)),
     )
 
-    motif_family = kw["motif_family"].fillna("").astype(str).values if "motif_family" in kw.columns else np.array([""] * len(kw), dtype=object)
-    specificity = kw["specificity_tier"].fillna(2).astype(int).values if "specificity_tier" in kw.columns else np.full(len(kw), 2, dtype=int)
-    scope_hint = kw["scope_hint"].fillna("").astype(str).values if "scope_hint" in kw.columns else np.array([""] * len(kw), dtype=object)
-    franchise_affinity = kw["franchise_affinity"].fillna(0.0).astype(float).values if "franchise_affinity" in kw.columns else np.zeros(len(kw), dtype=float)
-    recurrence_strength = kw["recurrence_strength"].fillna(0.0).astype(float).values if "recurrence_strength" in kw.columns else np.zeros(len(kw), dtype=float)
-    generic_motif_mask = (bucket_labels == "generic") | ((bucket_labels == "") & (specificity <= 2) & np.isin(motif_family, np.array(["genre", "tone"], dtype=object)))
-    specific_story_mask = (bucket_labels == "story_specific") | ((bucket_labels == "") & (specificity >= 3))
-    exact_anchor_mask = bucket_labels == "exact_anchor"
-    related_support_mask = bucket_labels == "related_support"
+    motif_family = view["motif_family"]
+    specificity = view["specificity"]
+    scope_hint = view["scope_hint"]
+    franchise_affinity = view["franchise_affinity"]
+    recurrence_strength = view["recurrence_strength"]
+    generic_motif_mask = view["generic_motif_mask"]
+    specific_story_mask = view["specific_story_mask"]
+    exact_anchor_mask = view["exact_anchor_mask"]
+    related_support_mask = view["related_support_mask"]
 
     year_slate_family_boosts = _year_slate_family_boosts(world, slate_terms)
 
@@ -5801,7 +5996,7 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
             1.0,
         )
 
-    usage_counts = np.array([world._keyword_usage_counts.get(int(kid), 0) for kid in keyword_ids], dtype=float)
+    usage_counts = _keyword_usage_array(world, view).copy()
     weights *= 1.0 / (1.0 + float(keyword_cfg["usage_penalty_scale"]) * usage_counts)
 
     exact_company_mask = np.zeros(len(kw), dtype=bool)
@@ -5821,8 +6016,17 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
         if not company_genres:
             company_genres.add(genre)
             company_related.update(related_genres)
-        exact_company_mask = np.array([(bool(topic) and topic in company_genres) for topic in kw_topic], dtype=bool)
-        related_company_mask = np.array([(bool(topic) and topic in company_related) for topic in kw_topic], dtype=bool)
+        company_key = (frozenset(company_genres), frozenset(company_related))
+        company_masks = view["company_masks"].get(company_key)
+        if company_masks is None:
+            company_masks = (
+                np.array([(bool(topic) and topic in company_genres) for topic in kw_topic], dtype=bool),
+                np.array([(bool(topic) and topic in company_related) for topic in kw_topic], dtype=bool),
+            )
+            if len(view["company_masks"]) >= 4096:
+                view["company_masks"].clear()
+            view["company_masks"][company_key] = company_masks
+        exact_company_mask, related_company_mask = company_masks
         weights *= np.where(exact_company_mask, float(keyword_cfg["company_exact_boost"]), 1.0)
         weights *= np.where(~exact_company_mask & related_company_mask, float(keyword_cfg["company_family_boost"]), 1.0)
     _kw_trace("company_bias", company_count=int(len(company_ids or [])))
@@ -5872,7 +6076,7 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
     slot_targets["exact_anchor"] = int(exact_topic_target)
     _kw_trace("slot_plan", requested_count=int(n), exact_topic_min=int(exact_topic_min), exact_topic_target=int(exact_topic_target), primary_plus_related_min=int(primary_plus_related_min), generic_cap=int(generic_limit), off_genre_cap=int(off_genre_limit), related_genres=sorted(related_genres), slot_targets={key: int(value) for key, value in slot_targets.items()})
 
-    ranked_indices = [int(idx) for idx in np.argsort(probs)[::-1]]
+    ranked_indices = np.argsort(probs)[::-1].tolist()
     chosen_indices: list[int] = []
     chosen_id_set: set[int] = set()
     exact_slot_mask = exact_anchor_mask & exact_genre_mask & ~generic_motif_mask
@@ -5969,6 +6173,7 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
 
     for kid in chosen_ids:
         world._keyword_usage_counts[int(kid)] += 1
+        _note_keyword_used(world, int(kid))
 
     top_idx = np.argsort(probs)[::-1][:8]
     confidence = confidence_from_scores(probs.tolist())
@@ -6019,7 +6224,7 @@ def pick_keywords(world: WorldState, concept: dict, n: int = None, company_ids: 
     concept["_keyword_candidates"] = [
         {
             "keyword_id": int(keyword_ids[idx]),
-            "keyword": str(keyword_text_raw.iloc[idx]),
+            "keyword": view["keyword_text_raw"][int(idx)],
             "topic_genre": str(kw_topic[idx]),
             "selection_bucket": str(bucket_labels[idx]),
             "motif_family": str(motif_family[idx]),

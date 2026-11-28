@@ -319,8 +319,10 @@ class LLMMasterClass:
             old_defunct = row_b.iloc[0].get("defunct_year")
             if old_defunct is None or (isinstance(old_defunct, float) and old_defunct != old_defunct):
                 self.world.companies.loc[mask_b, "defunct_year"] = int(year)
+                self.world._company_view = None  # pick_companies caches per-year company arrays
             else:
                 self.world.companies.loc[mask_b, "defunct_year"] = min(int(old_defunct), int(year))
+                self.world._company_view = None  # pick_companies caches per-year company arrays
 
         self.world._merge_families.setdefault(int(cid_a), set()).add(int(cid_b))
         self.world._merge_families.setdefault(int(cid_b), set()).add(int(cid_a))
@@ -343,6 +345,7 @@ class LLMMasterClass:
             return
         mask = self.world.companies["company_id"].astype(int) == cid
         self.world.companies.loc[mask, "specialty_genres"] = ";".join(genres)
+        self.world._company_view = None  # pick_companies caches per-year company arrays
         rep.applied += 1
 
     def _adjust_genre_weight(self, params: dict, year: int, rep: ActionReport) -> None:

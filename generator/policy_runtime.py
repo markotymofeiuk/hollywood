@@ -6,6 +6,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
+
 WORLD_POLICY_FILENAME = "world_policy.json"
 CONCEPT_PACKS_FILENAME = "concept_packs.json"
 YEAR_SLATE_PLAN_FILENAME = "year_slate_plan.json"
@@ -471,6 +473,22 @@ def normalize_counter_weights(
 
 
 def confidence_from_scores(scores: Sequence[float]) -> float:
+    if len(scores) > 64:
+        # Same result for long finite float inputs (per-movie probability
+        # vectors over whole pools): numpy sorts, and the total is still the
+        # left-to-right Python sum over the descending values.
+        try:
+            arr = np.asarray(scores, dtype=float)
+        except Exception:
+            arr = None
+        if arr is not None and arr.ndim == 1 and bool(np.isfinite(arr).all()):
+            ordered = np.sort(np.where(arr > 0.0, arr, 0.0))[::-1].tolist()
+            best = ordered[0]
+            second = ordered[1]
+            total = max(1e-9, sum(ordered))
+            margin = max(0.0, best - second)
+            concentration = best / total
+            return float(max(0.0, min(1.0, 0.55 * concentration + 0.45 * min(1.0, margin / max(0.05, best)))))
     vals = [max(0.0, safe_float(v, 0.0)) for v in scores]
     if not vals:
         return 0.0

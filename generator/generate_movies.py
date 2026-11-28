@@ -38,6 +38,7 @@ from world_state import WorldState, get_person_latent, get_company_latent, laten
 from llm_provider import get_llm_client, ordered_map, safe_json_parse
 from financials import compute_financials, edge_is_active, record_financial_outcome
 from assembly import (
+    _note_keyword_used,
     sample_movie_concept, pick_director, pick_co_director, pick_companies,
     pick_cast, pick_title, pick_keywords, pick_crew,
     _generate_tagline, _register_tagline_use, _tagline_reuse_score,
@@ -843,6 +844,7 @@ def assemble_movies(world: WorldState, n_movies: int = 5000,
             added += 1
             if hasattr(world, "_keyword_usage_counts"):
                 world._keyword_usage_counts[int(kid)] += 1
+                _note_keyword_used(world, int(kid))
             if added >= 3:
                 break
         return chosen
